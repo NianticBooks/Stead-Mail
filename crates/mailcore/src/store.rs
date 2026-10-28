@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, AuthKind, Provider, ServerConfig};
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE accounts (
@@ -75,6 +75,59 @@ CREATE TABLE oauth_identities (
 );
 "#;
 
+const MIGRATION_V3: &str = r#"
+ALTER TABLE messages ADD COLUMN references_hdr   TEXT;
+ALTER TABLE messages ADD COLUMN thread_id        TEXT;
+ALTER TABLE messages ADD COLUMN preview          TEXT;
+ALTER TABLE messages ADD COLUMN body_text        TEXT;
+ALTER TABLE messages ADD COLUMN body_html        TEXT;
+ALTER TABLE messages ADD COLUMN body_fetched_at  TEXT;
+ALTER TABLE messages ADD COLUMN has_attachments  INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX messages_by_thread ON messages(account_id, thread_id);
+
+CREATE TABLE attachments (
+    id           INTEGER PRIMARY KEY,
+    message_id   INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    part_index   INTEGER NOT NULL,
+    filename     TEXT,
+    content_type TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    content_id   TEXT,
+    inline       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX attachments_by_message ON attachments(message_id);
+
+-- External-content FTS5: text stays in `messages`, the index only holds tokens. Flag-only
+-- updates never touch it because the update trigger lists the indexed columns.
+CREATE VIRTUAL TABLE message_fts USING fts5(
+    subject, from_name, from_addr, to_addrs, body_text,
+    content='messages', content_rowid='id', tokenize='porter unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO message_fts(rowid, subject, from_name, from_addr, to_addrs, body_text)
+    VALUES (new.id, new.subject, new.from_name, new.from_addr, new.to_addrs, new.body_text);
+END;
+CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO message_fts(message_fts, rowid, subject, from_name, from_addr, to_addrs, body_text)
+    VALUES ('delete', old.id, old.subject, old.from_name, old.from_addr, old.to_addrs, old.body_text);
+END;
+CREATE TRIGGER messages_fts_au AFTER UPDATE OF subject, from_name, from_addr, to_addrs, body_text ON messages BEGIN
+    INSERT INTO message_fts(message_fts, rowid, subject, from_name, from_addr, to_addrs, body_text)
+    VALUES ('delete', old.id, old.subject, old.from_name, old.from_addr, old.to_addrs, old.body_text);
+    INSERT INTO message_fts(rowid, subject, from_name, from_addr, to_addrs, body_text)
+    VALUES (new.id, new.subject, new.from_name, new.from_addr, new.to_addrs, new.body_text);
+END;
+INSERT INTO message_fts(message_fts) VALUES ('rebuild');
+"#;
+
+/// Rows cached before v3 have no thread id. Give each one a stable id: its parent's message id
+/// when it is a reply (so siblings and replies to one message still group), else its own.
+const MIGRATION_V4: &str = r#"
+UPDATE messages
+   SET thread_id = COALESCE(in_reply_to, message_id, 'local:' || mailbox_id || ':' || uid)
+ WHERE thread_id IS NULL;
+"#;
+
 /// An OAuth2 login (e.g. a Google account authorised for Calendar). The refresh token lives in
 /// the secret store under [`OAuthIdentity::refresh_secret_key`], never in SQLite.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +168,8 @@ pub struct MessageHeader {
     pub uid: u32,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
+    /// Space separated Message-IDs from the References header, oldest first.
+    pub references: Option<String>,
     pub subject: Option<String>,
     pub from_name: Option<String>,
     pub from_addr: Option<String>,
@@ -124,16 +179,122 @@ pub struct MessageHeader {
     /// RFC 3339 from IMAP INTERNALDATE.
     pub internal_date: Option<String>,
     pub size: Option<u32>,
-    /// Space separated IMAP flags, e.g. `\Seen \Flagged`.
+    /// Space separated IMAP flags in canonical (sorted) order, e.g. `\Flagged \Seen`.
     pub flags: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageRow {
     pub id: i64,
     pub mailbox_id: i64,
     #[serde(flatten)]
     pub header: MessageHeader,
+    pub thread_id: Option<String>,
+    pub preview: Option<String>,
+    pub has_attachments: bool,
+    pub body_cached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentRow {
+    pub part_index: i64,
+    pub filename: Option<String>,
+    pub content_type: String,
+    pub size: i64,
+    pub content_id: Option<String>,
+    pub inline: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageDetail {
+    #[serde(flatten)]
+    pub row: MessageRow,
+    pub mailbox: String,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub attachments: Vec<AttachmentRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchHit {
+    pub mailbox: String,
+    pub snippet: String,
+    #[serde(flatten)]
+    pub row: MessageRow,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyCounts {
+    pub inserted: usize,
+    pub flags_updated: usize,
+    pub deleted: usize,
+}
+
+/// What the server told us about a mailbox when it was selected.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MailboxStateUpdate {
+    pub uidvalidity: Option<u32>,
+    pub uidnext: Option<u32>,
+    pub exists: Option<u32>,
+}
+
+fn msg_cols(prefix: &str) -> String {
+    [
+        "id", "mailbox_id", "uid", "message_id", "in_reply_to", "references_hdr", "subject", "from_name", "from_addr",
+        "to_addrs", "date", "internal_date", "size", "flags", "thread_id", "preview", "has_attachments",
+    ]
+    .iter()
+    .map(|c| format!("{prefix}{c}"))
+    .collect::<Vec<_>>()
+    .join(", ")
+        + &format!(", {prefix}body_fetched_at IS NOT NULL")
+}
+
+fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    Ok(MessageRow {
+        id: r.get(0)?,
+        mailbox_id: r.get(1)?,
+        header: MessageHeader {
+            uid: r.get(2)?,
+            message_id: r.get(3)?,
+            in_reply_to: r.get(4)?,
+            references: r.get(5)?,
+            subject: r.get(6)?,
+            from_name: r.get(7)?,
+            from_addr: r.get(8)?,
+            to_addrs: r.get(9)?,
+            date: r.get(10)?,
+            internal_date: r.get(11)?,
+            size: r.get(12)?,
+            flags: r.get(13)?,
+        },
+        thread_id: r.get(14)?,
+        preview: r.get(15)?,
+        has_attachments: r.get::<_, i64>(16)? != 0,
+        body_cached: r.get::<_, i64>(17)? != 0,
+    })
+}
+
+/// Turn free text into a safe FTS5 query: every word becomes a quoted phrase (so operators like
+/// `OR`, `-`, `:` or `*` typed by the user are inert) and the last word is a prefix match.
+pub fn fts_query(text: &str) -> Option<String> {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.replace('"', ""))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let last = words.len() - 1;
+    Some(
+        words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| if i == last { format!("\"{w}\"*") } else { format!("\"{w}\"") })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 pub struct Store {
@@ -168,6 +329,12 @@ impl Store {
         }
         if version < 2 {
             tx.execute_batch(MIGRATION_V2)?;
+        }
+        if version < 3 {
+            tx.execute_batch(MIGRATION_V3)?;
+        }
+        if version < 4 {
+            tx.execute_batch(MIGRATION_V4)?;
         }
         if version < SCHEMA_VERSION {
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -309,59 +476,198 @@ impl Store {
 
     // ----- messages -----
 
-    pub fn upsert_messages(&mut self, account_id: &str, mailbox_id: i64, headers: &[MessageHeader]) -> Result<usize> {
+    /// (uid, flags) of every cached message in a mailbox, ascending by uid.
+    pub fn local_uid_flags(&self, mailbox_id: i64) -> Result<Vec<(u32, String)>> {
+        let mut stmt = self.conn.prepare("SELECT uid, flags FROM messages WHERE mailbox_id = ?1 ORDER BY uid")?;
+        let rows = stmt.query_map([mailbox_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn mailbox_by_id(&self, mailbox_id: i64) -> Result<MailboxRow> {
+        self.conn
+            .query_row(
+                "SELECT id, account_id, name, delimiter, attributes, uidvalidity, uidnext, exists_count, last_synced_at
+                 FROM mailboxes WHERE id = ?1",
+                [mailbox_id],
+                |r| {
+                    Ok(MailboxRow {
+                        id: r.get(0)?, account_id: r.get(1)?, name: r.get(2)?, delimiter: r.get(3)?, attributes: r.get(4)?,
+                        uidvalidity: r.get(5)?, uidnext: r.get(6)?, exists_count: r.get(7)?, last_synced_at: r.get(8)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::MailboxNotFound(mailbox_id.to_string()))
+    }
+
+    /// Apply one sync result atomically: optional cache reset, new messages (with threading),
+    /// flag changes, expunges, and the mailbox's server state.
+    pub fn apply_sync(
+        &mut self,
+        account_id: &str,
+        mailbox_id: i64,
+        reset: bool,
+        new: &[MessageHeader],
+        flag_updates: &[(u32, String)],
+        expunged: &[u32],
+        state: MailboxStateUpdate,
+    ) -> Result<ApplyCounts> {
         let tx = self.conn.transaction()?;
-        let mut n = 0;
+        let mut counts = ApplyCounts::default();
+        if reset {
+            counts.deleted += tx.execute("DELETE FROM messages WHERE mailbox_id = ?1", [mailbox_id])?;
+        }
         {
-            let mut stmt = tx.prepare(
-                "INSERT INTO messages (account_id, mailbox_id, uid, message_id, in_reply_to, subject, from_name, from_addr,
-                                       to_addrs, date, internal_date, size, flags)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-                 ON CONFLICT(mailbox_id, uid) DO UPDATE SET flags = excluded.flags",
+            let mut insert = tx.prepare(
+                "INSERT INTO messages (account_id, mailbox_id, uid, message_id, in_reply_to, references_hdr, subject,
+                                       from_name, from_addr, to_addrs, date, internal_date, size, flags, thread_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                 ON CONFLICT(mailbox_id, uid) DO NOTHING",
             )?;
-            for h in headers {
-                n += stmt.execute(params![
-                    account_id, mailbox_id, h.uid, h.message_id, h.in_reply_to, h.subject, h.from_name, h.from_addr,
-                    h.to_addrs, h.date, h.internal_date, h.size, h.flags,
+            for h in new {
+                let thread = thread_for(&tx, account_id, mailbox_id, h)?;
+                let n = insert.execute(params![
+                    account_id, mailbox_id, h.uid, h.message_id, h.in_reply_to, h.references, h.subject, h.from_name,
+                    h.from_addr, h.to_addrs, h.date, h.internal_date, h.size, h.flags, thread,
                 ])?;
+                counts.inserted += n;
+                // Messages that used this one as a virtual thread root join its real thread.
+                if n == 1 {
+                    if let Some(mid) = &h.message_id {
+                        if *mid != thread {
+                            tx.execute(
+                                "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND thread_id = ?3 AND message_id IS NOT ?3",
+                                params![thread, account_id, mid],
+                            )?;
+                        }
+                    }
+                }
+            }
+            let mut upd = tx.prepare("UPDATE messages SET flags = ?3 WHERE mailbox_id = ?1 AND uid = ?2 AND flags != ?3")?;
+            for (uid, flags) in flag_updates {
+                counts.flags_updated += upd.execute(params![mailbox_id, uid, flags])?;
+            }
+            let mut del = tx.prepare("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+            for uid in expunged {
+                counts.deleted += del.execute(params![mailbox_id, uid])?;
             }
         }
+        tx.execute(
+            "UPDATE mailboxes SET uidvalidity = ?2, uidnext = ?3, exists_count = ?4,
+                    last_synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            params![mailbox_id, state.uidvalidity, state.uidnext, state.exists],
+        )?;
         tx.commit()?;
-        Ok(n)
+        Ok(counts)
     }
 
     pub fn list_messages(&self, mailbox_id: i64, limit: usize) -> Result<Vec<MessageRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, mailbox_id, uid, message_id, in_reply_to, subject, from_name, from_addr, to_addrs, date,
-                    internal_date, size, flags
-             FROM messages WHERE mailbox_id = ?1
-             ORDER BY COALESCE(date, internal_date) DESC, uid DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![mailbox_id, limit as i64], |r| {
-            Ok(MessageRow {
-                id: r.get(0)?,
-                mailbox_id: r.get(1)?,
-                header: MessageHeader {
-                    uid: r.get(2)?,
-                    message_id: r.get(3)?,
-                    in_reply_to: r.get(4)?,
-                    subject: r.get(5)?,
-                    from_name: r.get(6)?,
-                    from_addr: r.get(7)?,
-                    to_addrs: r.get(8)?,
-                    date: r.get(9)?,
-                    internal_date: r.get(10)?,
-                    size: r.get(11)?,
-                    flags: r.get(12)?,
-                },
-            })
-        })?;
+        let sql = format!(
+            "SELECT {} FROM messages WHERE mailbox_id = ?1 ORDER BY COALESCE(date, internal_date) DESC, uid DESC LIMIT ?2",
+            msg_cols("")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![mailbox_id, limit as i64], row_to_message)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn count_messages(&self, mailbox_id: i64) -> Result<i64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM messages WHERE mailbox_id = ?1", [mailbox_id], |r| r.get(0))?)
     }
+
+    pub fn find_message(&self, mailbox_id: i64, uid: u32) -> Result<MessageRow> {
+        let sql = format!("SELECT {} FROM messages WHERE mailbox_id = ?1 AND uid = ?2", msg_cols(""));
+        self.conn
+            .query_row(&sql, params![mailbox_id, uid], row_to_message)
+            .optional()?
+            .ok_or_else(|| Error::Invalid(format!("message uid {uid} is not cached; sync the mailbox first")))
+    }
+
+    pub fn message_detail(&self, row: MessageRow) -> Result<MessageDetail> {
+        let (text, html): (Option<String>, Option<String>) =
+            self.conn.query_row("SELECT body_text, body_html FROM messages WHERE id = ?1", [row.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mailbox: String = self.conn.query_row("SELECT name FROM mailboxes WHERE id = ?1", [row.mailbox_id], |r| r.get(0))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT part_index, filename, content_type, size, content_id, inline FROM attachments WHERE message_id = ?1 ORDER BY part_index",
+        )?;
+        let attachments = stmt
+            .query_map([row.id], |r| {
+                Ok(AttachmentRow {
+                    part_index: r.get(0)?, filename: r.get(1)?, content_type: r.get(2)?, size: r.get(3)?,
+                    content_id: r.get(4)?, inline: r.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(MessageDetail { row, mailbox, body_text: text, body_html: html, attachments })
+    }
+
+    pub fn set_message_body(&mut self, message_id: i64, body: &crate::body::ParsedBody) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE messages SET body_text = ?2, body_html = ?3, preview = ?4, has_attachments = ?5,
+                    body_fetched_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            params![message_id, body.text, body.html, body.preview(), !body.attachments.is_empty() as i64],
+        )?;
+        tx.execute("DELETE FROM attachments WHERE message_id = ?1", [message_id])?;
+        for a in &body.attachments {
+            tx.execute(
+                "INSERT INTO attachments (message_id, part_index, filename, content_type, size, content_id, inline)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![message_id, a.part_index, a.filename, a.content_type, a.size, a.content_id, a.inline as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Full-text search over cached subjects, addresses and fetched bodies, best match first.
+    pub fn search(&self, query: &str, account_id: Option<&str>, limit: usize) -> Result<Vec<SearchHit>> {
+        let Some(q) = fts_query(query) else { return Ok(Vec::new()) };
+        let sql = format!(
+            "SELECT {}, mb.name, snippet(message_fts, -1, '[', ']', '…', 12)
+             FROM message_fts JOIN messages m ON m.id = message_fts.rowid JOIN mailboxes mb ON mb.id = m.mailbox_id
+             WHERE message_fts MATCH ?1 AND (?2 IS NULL OR m.account_id = ?2)
+             ORDER BY rank LIMIT ?3",
+            msg_cols("m.")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![q, account_id, limit as i64], |r| {
+            Ok(SearchHit { row: row_to_message(r)?, mailbox: r.get(18)?, snippet: r.get(19)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every cached message in a thread, oldest first.
+    pub fn thread_messages(&self, account_id: &str, thread_id: &str) -> Result<Vec<MessageRow>> {
+        let sql = format!(
+            "SELECT {} FROM messages WHERE account_id = ?1 AND thread_id = ?2 ORDER BY COALESCE(date, internal_date), uid",
+            msg_cols("")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![account_id, thread_id], row_to_message)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+}
+
+/// Decide a new message's thread. A cached parent wins; otherwise the oldest referenced id acts
+/// as a virtual root so replies to a message we have not fetched still group together.
+fn thread_for(tx: &rusqlite::Transaction<'_>, account_id: &str, mailbox_id: i64, h: &MessageHeader) -> Result<String> {
+    let own = h.message_id.clone().unwrap_or_else(|| format!("local:{mailbox_id}:{}", h.uid));
+    let refs: Vec<&str> = h.references.as_deref().unwrap_or("").split_whitespace().collect();
+    let parent = h.in_reply_to.as_deref().or_else(|| refs.last().copied());
+    if let Some(p) = parent {
+        let cached: Option<String> = tx
+            .query_row(
+                "SELECT thread_id FROM messages WHERE account_id = ?1 AND message_id = ?2 AND thread_id IS NOT NULL LIMIT 1",
+                params![account_id, p],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(t) = cached {
+            return Ok(t);
+        }
+    }
+    Ok(refs.first().copied().or(parent).map(String::from).unwrap_or(own))
 }
 
 fn provider_str(p: Provider) -> &'static str {
@@ -446,21 +752,143 @@ mod tests {
         assert!(s.delete_oauth_identity("id1").unwrap());
     }
 
-    #[test]
-    fn mailbox_and_message_upsert_is_idempotent() {
-        let mut s = Store::open_in_memory().unwrap();
+    fn hdr(uid: u32, mid: &str, irt: Option<&str>, refs: Option<&str>) -> MessageHeader {
+        MessageHeader {
+            uid,
+            message_id: Some(mid.into()),
+            in_reply_to: irt.map(Into::into),
+            references: refs.map(Into::into),
+            subject: Some(format!("subject {uid}")),
+            ..Default::default()
+        }
+    }
+
+    fn setup() -> (Store, String, i64) {
+        let s = Store::open_in_memory().unwrap();
         let a = Account::from_preset("g", "f@gmail.com", Provider::Gmail).unwrap();
         s.insert_account(&a).unwrap();
         let mb = s.upsert_mailbox(&a.id, "INBOX", Some("/"), "").unwrap();
-        let mb2 = s.upsert_mailbox(&a.id, "INBOX", Some("."), "\\HasNoChildren").unwrap();
-        assert_eq!(mb, mb2);
-        let h = MessageHeader { uid: 7, subject: Some("hi".into()), flags: "".into(), ..Default::default() };
-        s.upsert_messages(&a.id, mb, &[h.clone()]).unwrap();
-        let h2 = MessageHeader { flags: "\\Seen".into(), ..h };
-        s.upsert_messages(&a.id, mb, &[h2]).unwrap();
+        (s, a.id, mb)
+    }
+
+    #[test]
+    fn apply_sync_is_idempotent_and_updates_flags_and_deletes() {
+        let (mut s, acct, mb) = setup();
+        let st = MailboxStateUpdate { uidvalidity: Some(1), uidnext: Some(10), exists: Some(2) };
+        let c = s.apply_sync(&acct, mb, false, &[hdr(7, "<a>", None, None), hdr(8, "<b>", None, None)], &[], &[], st).unwrap();
+        assert_eq!(c.inserted, 2);
+        // Re-applying the same headers inserts nothing.
+        let c = s.apply_sync(&acct, mb, false, &[hdr(7, "<a>", None, None)], &[], &[], st).unwrap();
+        assert_eq!(c.inserted, 0);
+        let c = s.apply_sync(&acct, mb, false, &[], &[(7, "\\Seen".into()), (8, "".into())], &[], st).unwrap();
+        assert_eq!(c.flags_updated, 1, "unchanged flags are not counted");
+        let c = s.apply_sync(&acct, mb, false, &[], &[], &[8], st).unwrap();
+        assert_eq!(c.deleted, 1);
         let rows = s.list_messages(mb, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].header.flags, "\\Seen");
+        let mbrow = s.mailbox_by_id(mb).unwrap();
+        assert_eq!((mbrow.uidvalidity, mbrow.uidnext, mbrow.exists_count), (Some(1), Some(10), Some(2)));
+        // reset wipes the cache before inserting
+        let c = s.apply_sync(&acct, mb, true, &[hdr(1, "<z>", None, None)], &[], &[], st).unwrap();
+        assert_eq!((c.inserted, c.deleted), (1, 1));
         assert_eq!(s.count_messages(mb).unwrap(), 1);
+    }
+
+    #[test]
+    fn threads_group_regardless_of_arrival_order() {
+        let (mut s, acct, mb) = setup();
+        let st = MailboxStateUpdate::default();
+        // Newest reply first (parent <a> and root <root> not cached yet): virtual root = <root>.
+        s.apply_sync(&acct, mb, false, &[hdr(30, "<c>", Some("<a>"), Some("<root> <a>"))], &[], &[], st).unwrap();
+        // The middle message arrives next; its only reference is the root.
+        s.apply_sync(&acct, mb, false, &[hdr(20, "<a>", Some("<root>"), Some("<root>"))], &[], &[], st).unwrap();
+        // Finally the root itself.
+        s.apply_sync(&acct, mb, false, &[hdr(10, "<root>", None, None)], &[], &[], st).unwrap();
+        let t = s.thread_messages(&acct, "<root>").unwrap();
+        assert_eq!(t.iter().map(|m| m.header.uid).collect::<Vec<_>>(), vec![10, 20, 30]);
+        // An unrelated message stays alone.
+        s.apply_sync(&acct, mb, false, &[hdr(40, "<other>", None, None)], &[], &[], st).unwrap();
+        assert_eq!(s.thread_messages(&acct, "<other>").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn late_parent_pulls_virtual_root_children_into_its_thread() {
+        let (mut s, acct, mb) = setup();
+        let st = MailboxStateUpdate::default();
+        // <p> is cached in thread <t>. <r> replies to <x>, which is not cached: virtual root <x>.
+        s.apply_sync(&acct, mb, false, &[hdr(1, "<t>", None, None), hdr(2, "<p>", Some("<t>"), Some("<t>"))], &[], &[], st).unwrap();
+        s.apply_sync(&acct, mb, false, &[hdr(5, "<r>", Some("<x>"), Some("<x>"))], &[], &[], st).unwrap();
+        assert_eq!(s.thread_messages(&acct, "<x>").unwrap().len(), 1);
+        // <x> arrives and turns out to be a reply to <p>: its thread is <t>, and <r> follows.
+        s.apply_sync(&acct, mb, false, &[hdr(4, "<x>", Some("<p>"), Some("<t> <p>"))], &[], &[], st).unwrap();
+        let t: Vec<u32> = s.thread_messages(&acct, "<t>").unwrap().iter().map(|m| m.header.uid).collect();
+        assert_eq!(t, vec![1, 2, 4, 5]);
+        assert!(s.thread_messages(&acct, "<x>").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fts_follows_inserts_updates_and_deletes_but_not_flag_changes() {
+        let (mut s, acct, mb) = setup();
+        let st = MailboxStateUpdate::default();
+        let mut h = hdr(1, "<a>", None, None);
+        h.subject = Some("Quarterly budget review".into());
+        h.from_name = Some("Jill Book".into());
+        s.apply_sync(&acct, mb, false, &[h], &[], &[], st).unwrap();
+        assert_eq!(s.search("budget", None, 10).unwrap().len(), 1);
+        assert_eq!(s.search("bud", None, 10).unwrap().len(), 1, "last word is a prefix match");
+        assert_eq!(s.search("jill", Some(&acct), 10).unwrap().len(), 1);
+        assert_eq!(s.search("jill", Some("other-account"), 10).unwrap().len(), 0);
+        assert_eq!(s.search("budget OR -\"x:*", None, 10).unwrap().len(), 0, "operators are inert, not a syntax error");
+        // Body arrives later and becomes searchable.
+        let row = s.find_message(mb, 1).unwrap();
+        let body = crate::body::ParsedBody { text: Some("Please approve the zeppelin purchase".into()), ..Default::default() };
+        s.set_message_body(row.id, &body).unwrap();
+        let hits = s.search("zeppelin", None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("[zeppelin]"), "{}", hits[0].snippet);
+        assert!(hits[0].row.body_cached);
+        // Flag-only updates leave the index alone and still searchable.
+        s.apply_sync(&acct, mb, false, &[], &[(1, "\\Seen".into())], &[], st).unwrap();
+        assert_eq!(s.search("zeppelin", None, 10).unwrap().len(), 1);
+        // Expunge removes it from the index.
+        s.apply_sync(&acct, mb, false, &[], &[], &[1], st).unwrap();
+        assert_eq!(s.search("zeppelin", None, 10).unwrap().len(), 0);
+        assert_eq!(s.search("", None, 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn upgrading_a_v2_database_threads_old_rows_and_indexes_them() {
+        // Build a genuine v2 database (what Phase 0/1 users have), with rows that predate threading.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute_batch(MIGRATION_V2).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2").unwrap();
+        conn.execute("INSERT INTO accounts VALUES ('a','n','e@x.com','custom','password','h',993,0,'u','h',587,1,'u',datetime('now'))", []).unwrap();
+        conn.execute("INSERT INTO mailboxes (id, account_id, name) VALUES (1,'a','INBOX')", []).unwrap();
+        for (uid, mid, irt, subject) in [(1, Some("<p>"), None, "Plan"), (2, Some("<r1>"), Some("<p>"), "Re: Plan"), (3, Some("<r2>"), Some("<p>"), "Re: Plan"), (4, None, None, "No id")] {
+            conn.execute(
+                "INSERT INTO messages (account_id, mailbox_id, uid, message_id, in_reply_to, subject, flags) VALUES ('a',1,?1,?2,?3,?4,'')",
+                params![uid, mid, irt, subject],
+            ).unwrap();
+        }
+        let s = Store::init(conn).unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let thread = |uid: u32| s.find_message(1, uid).unwrap().thread_id.unwrap();
+        assert_eq!(thread(1), "<p>");
+        assert_eq!(thread(2), "<p>");
+        assert_eq!(thread(3), "<p>", "replies to one message share its thread");
+        assert_eq!(thread(4), "local:1:4", "messages with no ids still get a unique thread");
+        assert_eq!(s.thread_messages("a", "<p>").unwrap().len(), 3);
+        // The pre-existing rows were indexed by the migration's FTS rebuild.
+        assert_eq!(s.search("plan", None, 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn fts_query_quotes_every_word() {
+        assert_eq!(fts_query("hello wor").unwrap(), "\"hello\" \"wor\"*");
+        assert_eq!(fts_query("  a\"b  ").unwrap(), "\"ab\"*");
+        assert_eq!(fts_query("   "), None);
     }
 }

@@ -31,8 +31,46 @@ enum Cmd {
         account: String,
         #[arg(long, default_value = "INBOX")]
         mailbox: String,
+        /// Messages to pull on the first sync of a mailbox. Later syncs fetch only changes.
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Also pull this many older messages below the oldest cached one.
+        #[arg(long, default_value_t = 0)]
+        backfill: u32,
+    },
+    /// Download and show one message (the body is cached locally after the first time).
+    Show {
+        account: String,
+        uid: u32,
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        /// Print the raw HTML part instead of the plain text.
+        #[arg(long)]
+        html: bool,
+    },
+    /// Full-text search over cached subjects, addresses and downloaded bodies.
+    Search {
+        query: String,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Every cached message of a conversation, oldest first.
+    Thread { account: String, thread_id: String },
+    /// Stay connected with IDLE and re-sync whenever the server reports a change.
+    Watch {
+        account: String,
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Re-issue IDLE after this many minutes of silence (servers drop idle links at ~30).
+        #[arg(long, default_value_t = 25)]
+        idle_minutes: u64,
+        /// Stop after this many sync passes (default: run until interrupted).
+        #[arg(long)]
+        cycles: Option<u32>,
     },
     /// List cached messages (newest first).
     Messages {
@@ -194,9 +232,59 @@ async fn main() -> Result<()> {
                 println!("{:<40} exists={:<6} uidvalidity={:<12} synced={}", m.name, fmt_opt(m.exists_count), fmt_opt(m.uidvalidity), m.last_synced_at.clone().unwrap_or_else(|| "never".into()));
             }
         }),
-        Cmd::Sync { account, mailbox, limit } => out(cli.json, &api.sync_mailbox(&account, &mailbox, limit).await?, |r| {
-            println!("synced {}/{}: {} on server, fetched {}, stored {}, {} mailboxes{}", r.account, r.mailbox, r.exists, r.fetched, r.stored, r.mailboxes_seen, if r.uidvalidity_changed { " (UIDVALIDITY changed, cache reset)" } else { "" })
+        Cmd::Sync { account, mailbox, limit, backfill } => {
+            let opts = mailcore::sync::SyncOptions { initial_limit: limit, backfill };
+            out(cli.json, &api.sync_mailbox_opts(&account, &mailbox, opts).await?, |r| println!("{}", fmt_sync(r)))
+        }
+        Cmd::Show { account, uid, mailbox, html } => out(cli.json, &api.fetch_message(&account, &mailbox, uid).await?, |d| {
+            let h = &d.row.header;
+            println!("From:    {} <{}>", h.from_name.clone().unwrap_or_default(), h.from_addr.clone().unwrap_or_default());
+            println!("To:      {}", h.to_addrs.clone().unwrap_or_default());
+            println!("Date:    {}", h.date.clone().or_else(|| h.internal_date.clone()).unwrap_or_default());
+            println!("Subject: {}", h.subject.clone().unwrap_or_default());
+            println!("Flags:   {}   Thread: {}", if h.flags.is_empty() { "(unread)" } else { &h.flags }, d.row.thread_id.clone().unwrap_or_default());
+            for a in &d.attachments {
+                println!("Attach:  {} ({}, {} bytes){}", a.filename.clone().unwrap_or_else(|| "(unnamed)".into()), a.content_type, a.size, if a.inline { " inline" } else { "" });
+            }
+            println!();
+            let body = if html { d.body_html.clone() } else { d.body_text.clone() };
+            println!("{}", body.unwrap_or_else(|| "(no body)".into()));
         }),
+        Cmd::Search { query, account, limit } => out(cli.json, &api.search(&query, account.as_deref(), limit)?, |hits| {
+            if hits.is_empty() {
+                println!("no matches (search covers cached headers and downloaded bodies; sync or `show` more mail)");
+            }
+            for h in hits {
+                let r = &h.row.header;
+                println!("{:>7} {:<14.14} {:<24.24} {}\n        {}", r.uid, h.mailbox, r.from_name.clone().or_else(|| r.from_addr.clone()).unwrap_or_default(), r.subject.clone().unwrap_or_default(), h.snippet.replace('\n', " "));
+            }
+        }),
+        Cmd::Thread { account, thread_id } => out(cli.json, &api.thread(&account, &thread_id)?, |rows| {
+            for m in rows {
+                let h = &m.header;
+                println!("{:>7}  {:<25.25}  {:<24.24}  {}", h.uid, h.date.clone().unwrap_or_default(), h.from_name.clone().or_else(|| h.from_addr.clone()).unwrap_or_default(), h.subject.clone().unwrap_or_default());
+            }
+        }),
+        Cmd::Watch { account, mailbox, limit, idle_minutes, cycles } => {
+            eprintln!("watching {account}/{mailbox} (Ctrl-C to stop)");
+            let opts = mailcore::sync::SyncOptions { initial_limit: limit, backfill: 0 };
+            let json = cli.json;
+            api.watch(
+                &account,
+                &mailbox,
+                opts,
+                std::time::Duration::from_secs(idle_minutes * 60),
+                |r| {
+                    if json {
+                        println!("{}", serde_json::to_string(r).unwrap_or_default());
+                    } else {
+                        println!("{}  {}", chrono::Local::now().format("%H:%M:%S"), fmt_sync(r));
+                    }
+                },
+                cycles,
+            )
+            .await?;
+        }
         Cmd::Messages { account, mailbox, limit } => out(cli.json, &api.list_messages(&account, &mailbox, limit)?, |list| {
             for m in list {
                 let h = &m.header;
@@ -279,6 +367,14 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn fmt_sync(r: &mailcore::api::SyncReport) -> String {
+    format!(
+        "{}/{}: {} on server, {} cached | new {} flags {} expunged {} backfilled {}{}",
+        r.account, r.mailbox, r.exists, r.cached_total, r.stored, r.flags_updated, r.expunged, r.backfilled,
+        if r.uidvalidity_changed { " | UIDVALIDITY changed, cache reset" } else { "" }
+    )
 }
 
 fn out<T: serde::Serialize>(json: bool, v: &T, human: impl FnOnce(&T)) {

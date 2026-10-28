@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use async_imap::types::{Fetch, Name};
 use async_imap::{Client, Session};
 use futures_util::TryStreamExt;
@@ -32,14 +35,14 @@ pub struct MailboxInfo {
     pub attributes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct MailboxState {
     pub exists: u32,
     pub uidvalidity: Option<u32>,
     pub uidnext: Option<u32>,
 }
 
-const HEADER_FIELDS: &str = "FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO";
+const HEADER_FIELDS: &str = "FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES";
 
 /// Open an implicit-TLS connection (port 993 style) and consume the server greeting.
 pub async fn connect_tls(host: &str, port: u16) -> Result<Client<TlsStream<TcpStream>>> {
@@ -110,13 +113,22 @@ fn header_from_fetch(f: &Fetch) -> Option<MessageHeader> {
         uid,
         size: f.size,
         internal_date: f.internal_date().map(|d| d.to_rfc3339()),
-        flags: f.flags().map(|fl| flag_to_string(&fl)).collect::<Vec<_>>().join(" "),
+        flags: canonical_flags(f.flags().map(|fl| flag_to_string(&fl))),
         ..Default::default()
     };
     if let Some(raw) = f.header() {
         parse_header_fields(raw, &mut h);
     }
     Some(h)
+}
+
+/// Sorted, space-joined flags. Servers may reorder flags between responses; a canonical form
+/// keeps "did the flags change" a plain string comparison.
+pub fn canonical_flags(flags: impl Iterator<Item = String>) -> String {
+    let mut v: Vec<String> = flags.collect();
+    v.sort();
+    v.dedup();
+    v.join(" ")
 }
 
 /// Render an IMAP flag in wire form (`\\Seen`, `\\Flagged`, `$Label1`).
@@ -160,62 +172,281 @@ pub fn parse_header_fields(raw: &[u8], h: &mut MessageHeader) {
     h.date = msg.date().map(|d| d.to_rfc3339());
     h.message_id = msg.message_id().map(|s| s.to_string());
     h.in_reply_to = msg.in_reply_to().and_then(|l| l.first()).map(|s| s.to_string());
+    h.references = msg.references().map(|l| l.iter().collect::<Vec<_>>().join(" ")).filter(|s| !s.is_empty());
+}
+
+fn header_query() -> String {
+    format!("(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS ({HEADER_FIELDS})])")
+}
+
+/// SELECT and report the server-side state without fetching anything.
+pub async fn select_state<T: ImapStream>(session: &mut Session<T>, mailbox: &str) -> Result<MailboxState> {
+    let mb = session.select(mailbox).await?;
+    Ok(MailboxState { exists: mb.exists, uidvalidity: mb.uid_validity, uidnext: mb.uid_next })
+}
+
+/// Headers of the newest `limit` messages by sequence number (used for the first sync only).
+pub async fn fetch_newest_headers<T: ImapStream>(session: &mut Session<T>, exists: u32, limit: u32) -> Result<Vec<MessageHeader>> {
+    if exists == 0 || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let start = exists.saturating_sub(limit.saturating_sub(1)).max(1);
+    let fetches: Vec<Fetch> = session.fetch(format!("{start}:{exists}"), header_query()).await?.try_collect().await?;
+    let mut headers: Vec<MessageHeader> = fetches.iter().filter_map(header_from_fetch).collect();
+    headers.sort_by_key(|h| h.uid);
+    Ok(headers)
+}
+
+/// Headers for a UID set such as `1001:*` or `5,9,12`.
+pub async fn fetch_headers_by_uidset<T: ImapStream>(session: &mut Session<T>, uid_set: &str) -> Result<Vec<MessageHeader>> {
+    let fetches: Vec<Fetch> = session.uid_fetch(uid_set, header_query()).await?.try_collect().await?;
+    let mut headers: Vec<MessageHeader> = fetches.iter().filter_map(header_from_fetch).collect();
+    headers.sort_by_key(|h| h.uid);
+    Ok(headers)
+}
+
+/// Current flags of every message with a UID in `min..=max`. Expunged UIDs are simply absent.
+pub async fn fetch_flags_range<T: ImapStream>(session: &mut Session<T>, min: u32, max: u32) -> Result<HashMap<u32, String>> {
+    let fetches: Vec<Fetch> = session.uid_fetch(format!("{min}:{max}"), "(UID FLAGS)").await?.try_collect().await?;
+    Ok(fetches
+        .iter()
+        .filter_map(|f| Some((f.uid?, canonical_flags(f.flags().map(|fl| flag_to_string(&fl))))))
+        .collect())
+}
+
+/// `UID SEARCH <criteria>`, ascending.
+pub async fn search_uids<T: ImapStream>(session: &mut Session<T>, criteria: &str) -> Result<Vec<u32>> {
+    let mut v: Vec<u32> = session.uid_search(criteria).await?.into_iter().collect();
+    v.sort_unstable();
+    Ok(v)
+}
+
+/// The complete RFC 822 message. Uses PEEK so reading does not set \Seen.
+pub async fn fetch_raw<T: ImapStream>(session: &mut Session<T>, uid: u32) -> Result<Option<Vec<u8>>> {
+    let fetches: Vec<Fetch> = session.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])").await?.try_collect().await?;
+    Ok(fetches.iter().find(|f| f.uid == Some(uid)).and_then(|f| f.body().map(|b| b.to_vec())))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleOutcome {
+    /// The server pushed something (new mail, flag change, expunge). Re-sync.
+    Changed,
+    /// Nothing happened before the timeout. Re-issue IDLE (servers drop idle connections ~30 min).
+    Timeout,
+}
+
+/// Enter IDLE on the currently selected mailbox and wait for a push or the timeout.
+pub async fn idle_wait<T: ImapStream>(session: Session<T>, timeout: Duration) -> Result<(Session<T>, IdleOutcome)> {
+    let mut handle = session.idle();
+    handle.init().await?;
+    let outcome = {
+        let (wait, _interrupt) = handle.wait_with_timeout(timeout);
+        match wait.await? {
+            async_imap::extensions::idle::IdleResponse::NewData(_) => IdleOutcome::Changed,
+            _ => IdleOutcome::Timeout,
+        }
+    };
+    let session = handle.done().await?;
+    Ok((session, outcome))
 }
 
 #[cfg(test)]
 pub(crate) mod fake_server {
-    //! A tiny scripted IMAP server good enough to exercise LOGIN/LIST/SELECT/FETCH/LOGOUT.
+    //! A small stateful IMAP server: LOGIN, LIST, SELECT, FETCH, UID FETCH, UID SEARCH, IDLE and
+    //! LOGOUT over one mailbox whose contents tests can mutate between connections.
+    use std::sync::{Arc, Mutex};
+
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
     pub const HEADERS_1: &str = "From: Jill Book <jill@example.com>\r\nTo: Fred Book <fred@example.com>\r\nSubject: =?UTF-8?Q?Caf=C3=A9_meeting?=\r\nDate: Mon, 26 Oct 2026 09:15:00 -0400\r\nMessage-ID: <m1@example.com>\r\n\r\n";
-    pub const HEADERS_2: &str = "From: calendar@example.org\r\nTo: fred@example.com, kobe@example.com\r\nSubject: Invitation: Dentist\r\nDate: Tue, 27 Oct 2026 08:00:00 +0000\r\nMessage-ID: <m2@example.org>\r\nIn-Reply-To: <m1@example.com>\r\n\r\n";
+    pub const HEADERS_2: &str = "From: calendar@example.org\r\nTo: fred@example.com, kobe@example.com\r\nSubject: Invitation: Dentist\r\nDate: Tue, 27 Oct 2026 08:00:00 +0000\r\nMessage-ID: <m2@example.org>\r\nIn-Reply-To: <m1@example.com>\r\nReferences: <m1@example.com>\r\n\r\n";
 
-    /// Start the server on an ephemeral port; returns the port. Serves exactly one connection.
+    #[derive(Clone)]
+    pub struct FakeMsg {
+        pub uid: u32,
+        pub flags: String,
+        pub raw: String,
+        pub internal_date: String,
+    }
+
+    pub struct FakeState {
+        pub uidvalidity: u32,
+        pub uidnext: u32,
+        pub msgs: Vec<FakeMsg>,
+        /// When set, IDLE pushes `* N EXISTS` shortly after it starts.
+        pub push_on_idle: bool,
+        /// Every command line received, for assertions about what the client asked for.
+        pub log: Vec<String>,
+    }
+
+    impl FakeState {
+        pub fn standard() -> FakeState {
+            FakeState {
+                uidvalidity: 42,
+                uidnext: 1003,
+                msgs: vec![
+                    FakeMsg { uid: 1001, flags: "\\Seen".into(), raw: format!("{HEADERS_1}Hello from Jill about the meeting.\r\n"), internal_date: "26-Oct-2026 13:15:00 +0000".into() },
+                    FakeMsg { uid: 1002, flags: String::new(), raw: format!("{HEADERS_2}Your dentist appointment is Thursday.\r\n"), internal_date: "27-Oct-2026 08:00:01 +0000".into() },
+                ],
+                push_on_idle: false,
+                log: Vec::new(),
+            }
+        }
+
+        pub fn add(&mut self, headers: &str, body: &str, flags: &str) -> u32 {
+            let uid = self.uidnext;
+            self.uidnext += 1;
+            self.msgs.push(FakeMsg { uid, flags: flags.into(), raw: format!("{headers}{body}"), internal_date: "28-Oct-2026 10:00:00 +0000".into() });
+            uid
+        }
+    }
+
+    pub type Shared = Arc<Mutex<FakeState>>;
+
+    /// Parse `1001:*`, `5,9`, `7` against the current max uid. Like real servers, `n:*` always
+    /// includes the highest message even when n is above it.
+    fn parse_set(set: &str, max: u32) -> Vec<(u32, u32)> {
+        set.split(',')
+            .filter_map(|part| {
+                let num = |x: &str| if x == "*" { Some(max) } else { x.parse::<u32>().ok() };
+                match part.split_once(':') {
+                    Some((a, b)) => {
+                        let (a, b) = (num(a)?, num(b)?);
+                        Some((a.min(b), a.max(b)))
+                    }
+                    None => num(part).map(|n| (n, n)),
+                }
+            })
+            .collect()
+    }
+
+    fn in_set(ranges: &[(u32, u32)], uid: u32) -> bool {
+        ranges.iter().any(|(a, b)| uid >= *a && uid <= *b)
+    }
+
+    fn fetch_line(seq: usize, m: &FakeMsg, query: &str) -> String {
+        let q = query.to_ascii_uppercase();
+        let mut items = format!("UID {}", m.uid);
+        if q.contains("FLAGS") {
+            items += &format!(" FLAGS ({})", m.flags);
+        }
+        if q.contains("INTERNALDATE") {
+            items += &format!(" INTERNALDATE \"{}\"", m.internal_date);
+        }
+        if q.contains("RFC822.SIZE") {
+            items += &format!(" RFC822.SIZE {}", m.raw.len());
+        }
+        if q.contains("HEADER.FIELDS") {
+            let end = m.raw.find("\r\n\r\n").map(|i| i + 4).unwrap_or(m.raw.len());
+            let head = &m.raw[..end];
+            items += &format!(" BODY[HEADER.FIELDS ({})] {{{}}}\r\n{}", super::HEADER_FIELDS, head.len(), head);
+        } else if q.contains("BODY.PEEK[]") || q.contains("BODY[]") {
+            items += &format!(" BODY[] {{{}}}\r\n{}", m.raw.len(), m.raw);
+        }
+        format!("* {seq} FETCH ({items})\r\n")
+    }
+
     pub async fn start() -> u16 {
+        start_with(Arc::new(Mutex::new(FakeState::standard()))).await
+    }
+
+    /// Serve any number of connections against shared state; returns the port.
+    pub async fn start_with(state: Shared) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            let (r, mut w) = sock.into_split();
-            let mut lines = BufReader::new(r).lines();
-            w.write_all(b"* OK [CAPABILITY IMAP4rev1] fake ready\r\n").await.unwrap();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let mut parts = line.splitn(3, ' ');
-                let tag = parts.next().unwrap_or("*").to_string();
-                let cmd = parts.next().unwrap_or("").to_ascii_uppercase();
-                let args = parts.next().unwrap_or("").to_string();
-                let resp = match cmd.as_str() {
-                    "LOGIN" => {
-                        if args.contains("\"good-password\"") || args.contains(" good-password") {
-                            format!("{tag} OK [CAPABILITY IMAP4rev1] LOGIN completed\r\n")
-                        } else {
-                            format!("{tag} NO [AUTHENTICATIONFAILED] bad credentials\r\n")
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { return };
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = sock.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    let _ = w.write_all(b"* OK [CAPABILITY IMAP4rev1 IDLE UIDPLUS] fake ready\r\n").await;
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        state.lock().unwrap().log.push(line.clone());
+                        let mut parts = line.splitn(3, ' ');
+                        let tag = parts.next().unwrap_or("*").to_string();
+                        let mut cmd = parts.next().unwrap_or("").to_ascii_uppercase();
+                        let mut args = parts.next().unwrap_or("").to_string();
+                        let is_uid = cmd == "UID";
+                        if is_uid {
+                            let (sub, rest) = args.split_once(' ').unwrap_or((args.as_str(), ""));
+                            cmd = format!("UID {}", sub.to_ascii_uppercase());
+                            args = rest.to_string();
+                        }
+                        let resp = match cmd.as_str() {
+                            "LOGIN" => {
+                                if args.contains("good-password") {
+                                    format!("{tag} OK [CAPABILITY IMAP4rev1] LOGIN completed\r\n")
+                                } else {
+                                    format!("{tag} NO [AUTHENTICATIONFAILED] bad credentials\r\n")
+                                }
+                            }
+                            "CAPABILITY" => format!("* CAPABILITY IMAP4rev1 IDLE\r\n{tag} OK CAPABILITY completed\r\n"),
+                            "LIST" => format!(
+                                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent Messages\"\r\n{tag} OK LIST completed\r\n"
+                            ),
+                            "SELECT" | "EXAMINE" => {
+                                let st = state.lock().unwrap();
+                                format!(
+                                    "* {} EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY {}] UIDs valid\r\n* OK [UIDNEXT {}] Predicted next UID\r\n* FLAGS (\\Seen \\Answered \\Flagged)\r\n* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\*)] Limited\r\n{tag} OK [READ-WRITE] SELECT completed\r\n",
+                                    st.msgs.len(), st.uidvalidity, st.uidnext
+                                )
+                            }
+                            "FETCH" | "UID FETCH" => {
+                                let st = state.lock().unwrap();
+                                let (set, query) = args.split_once(' ').unwrap_or((args.as_str(), ""));
+                                let max = st.msgs.iter().map(|m| m.uid).max().unwrap_or(0);
+                                let ranges = parse_set(set, if is_uid { max } else { st.msgs.len() as u32 });
+                                let mut out = String::new();
+                                for (i, m) in st.msgs.iter().enumerate() {
+                                    let key = if is_uid { m.uid } else { i as u32 + 1 };
+                                    if in_set(&ranges, key) {
+                                        out += &fetch_line(i + 1, m, query);
+                                    }
+                                }
+                                format!("{out}{tag} OK FETCH completed\r\n")
+                            }
+                            "UID SEARCH" => {
+                                let st = state.lock().unwrap();
+                                let max = st.msgs.iter().map(|m| m.uid).max().unwrap_or(0);
+                                let ranges = match args.trim().strip_prefix("UID ") {
+                                    Some(set) => parse_set(set, max),
+                                    None => vec![(0, u32::MAX)],
+                                };
+                                let uids: Vec<String> = st.msgs.iter().filter(|m| in_set(&ranges, m.uid)).map(|m| m.uid.to_string()).collect();
+                                format!("* SEARCH {}\r\n{tag} OK SEARCH completed\r\n", uids.join(" "))
+                            }
+                            "IDLE" => {
+                                let (push, n) = {
+                                    let st = state.lock().unwrap();
+                                    (st.push_on_idle, st.msgs.len() + 1)
+                                };
+                                let _ = w.write_all(b"+ idling\r\n").await;
+                                if push {
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                    let _ = w.write_all(format!("* {n} EXISTS\r\n").as_bytes()).await;
+                                }
+                                // Wait for DONE, then terminate the command.
+                                while let Ok(Some(l)) = lines.next_line().await {
+                                    if l.trim().eq_ignore_ascii_case("DONE") {
+                                        break;
+                                    }
+                                }
+                                format!("{tag} OK IDLE terminated\r\n")
+                            }
+                            "LOGOUT" => {
+                                let _ = w.write_all(format!("* BYE fake signing off\r\n{tag} OK LOGOUT completed\r\n").as_bytes()).await;
+                                break;
+                            }
+                            _ => format!("{tag} OK {cmd} completed\r\n"),
+                        };
+                        if w.write_all(resp.as_bytes()).await.is_err() {
+                            break;
                         }
                     }
-                    "CAPABILITY" => format!("* CAPABILITY IMAP4rev1\r\n{tag} OK CAPABILITY completed\r\n"),
-                    "LIST" => format!(
-                        "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent Messages\"\r\n{tag} OK LIST completed\r\n"
-                    ),
-                    "SELECT" | "EXAMINE" => format!(
-                        "* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 42] UIDs valid\r\n* OK [UIDNEXT 1003] Predicted next UID\r\n* FLAGS (\\Seen \\Answered \\Flagged)\r\n* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\*)] Limited\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
-                    ),
-                    "FETCH" => {
-                        let section = format!("BODY[HEADER.FIELDS ({})]", super::HEADER_FIELDS);
-                        format!(
-                            "* 1 FETCH (UID 1001 FLAGS (\\Seen) INTERNALDATE \"26-Oct-2026 13:15:00 +0000\" RFC822.SIZE 2048 {section} {{{}}}\r\n{})\r\n\
-                             * 2 FETCH (UID 1002 FLAGS () INTERNALDATE \"27-Oct-2026 08:00:01 +0000\" RFC822.SIZE 4096 {section} {{{}}}\r\n{})\r\n\
-                             {tag} OK FETCH completed\r\n",
-                            HEADERS_1.len(), HEADERS_1, HEADERS_2.len(), HEADERS_2
-                        )
-                    }
-                    "LOGOUT" => {
-                        w.write_all(format!("* BYE fake signing off\r\n{tag} OK LOGOUT completed\r\n").as_bytes()).await.unwrap();
-                        break;
-                    }
-                    _ => format!("{tag} OK {cmd} completed\r\n"),
-                };
-                w.write_all(resp.as_bytes()).await.unwrap();
+                });
             }
         });
         port
@@ -249,7 +480,7 @@ mod tests {
         assert_eq!(h1.from_addr.as_deref(), Some("jill@example.com"));
         assert_eq!(h1.message_id.as_deref(), Some("m1@example.com"));
         assert_eq!(h1.flags, "\\Seen");
-        assert_eq!(h1.size, Some(2048));
+        assert_eq!(h1.size, Some(format!("{}Hello from Jill about the meeting.\r\n", fake_server::HEADERS_1).len() as u32));
         assert!(h1.date.as_deref().unwrap().starts_with("2026-10-26T09:15:00"));
         assert!(h1.internal_date.as_deref().unwrap().starts_with("2026-10-26T13:15:00"));
 
@@ -260,6 +491,45 @@ mod tests {
         assert_eq!(h2.flags, "");
 
         logout(session).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_reports_a_push_and_a_timeout() {
+        use std::sync::{Arc, Mutex};
+        let state = Arc::new(Mutex::new(fake_server::FakeState::standard()));
+        state.lock().unwrap().push_on_idle = true;
+        let port = fake_server::start_with(state.clone()).await;
+        let client = connect_plain("127.0.0.1", port).await.unwrap();
+        let mut session = login(client, "u", "good-password").await.unwrap();
+        select_state(&mut session, "INBOX").await.unwrap();
+        let (session, outcome) = idle_wait(session, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(outcome, IdleOutcome::Changed);
+
+        // Without a push the wait ends at the timeout, and the session is still usable after DONE.
+        state.lock().unwrap().push_on_idle = false;
+        let (mut session, outcome) = idle_wait(session, Duration::from_millis(200)).await.unwrap();
+        assert_eq!(outcome, IdleOutcome::Timeout);
+        assert_eq!(list_mailboxes(&mut session).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn uid_primitives_follow_real_server_range_rules() {
+        use std::sync::{Arc, Mutex};
+        let state = Arc::new(Mutex::new(fake_server::FakeState::standard()));
+        let port = fake_server::start_with(state).await;
+        let client = connect_plain("127.0.0.1", port).await.unwrap();
+        let mut session = login(client, "u", "good-password").await.unwrap();
+        select_state(&mut session, "INBOX").await.unwrap();
+        // `n:*` above the highest uid still returns the highest message (RFC 3501 §6.4.8).
+        let h = fetch_headers_by_uidset(&mut session, "1003:*").await.unwrap();
+        assert_eq!(h.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![1002]);
+        let flags = fetch_flags_range(&mut session, 1001, 1002).await.unwrap();
+        assert_eq!(flags[&1001], "\\Seen");
+        assert_eq!(flags[&1002], "");
+        assert_eq!(search_uids(&mut session, "UID 1:1001").await.unwrap(), vec![1001]);
+        let raw = fetch_raw(&mut session, 1002).await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&raw).contains("dentist appointment"));
+        assert!(fetch_raw(&mut session, 9999).await.unwrap().is_none());
     }
 
     #[tokio::test]

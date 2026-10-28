@@ -6,6 +6,7 @@
 
 pub mod account;
 pub mod api;
+pub mod body;
 pub mod caldav;
 pub mod error;
 pub mod google;
@@ -14,6 +15,7 @@ pub mod oauth;
 pub mod rpc;
 pub mod secrets;
 pub mod smtp;
+pub mod sync;
 pub mod store;
 
 pub use account::{Account, AuthKind, Provider, ServerConfig};

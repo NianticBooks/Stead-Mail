@@ -19,6 +19,20 @@ Service / Keychain with an encrypted-file fallback; hybrid AI (local Ollama for 
 triage, cloud for drafting) with 100% human-in-the-loop; Google Calendar REST + iCloud CalDAV
 two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
+## Phase 2 (sync engine) — what exists
+
+- Incremental IMAP sync: first pass pulls the newest N, later passes fetch only new UIDs, one
+  flags fetch over the cached range detects flag changes and expunges, UIDVALIDITY resets the cache
+- `mailcore sync --backfill N` walks older mail in batches; `mailcore watch` keeps an IDLE
+  connection open and re-syncs on every push, reconnecting with backoff
+- `mailcore show ACCOUNT UID` downloads one body (PEEK, so it never marks mail as read), parses
+  MIME text, HTML and attachment metadata, and caches it
+- `mailcore search QUERY` is FTS5 full text over cached subjects, addresses and downloaded bodies
+- Conversation threading from In-Reply-To/References (`mailcore thread`), stable under any
+  arrival order; schema v4
+- Not yet: SMTP outbox with retry, attachment download, sync of folders other than the one asked
+  for, POP3 (deprioritised)
+
 ## Phase 1 (auth + daemon) — what exists
 
 - `mailcore account test` now checks IMAP and SMTP logins; `mailcore send` sends plain text

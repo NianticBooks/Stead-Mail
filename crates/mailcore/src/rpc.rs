@@ -51,6 +51,39 @@ fn code_for(e: &Error) -> i64 {
 }
 
 #[derive(Deserialize)]
+struct MessageParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    uid: u32,
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    query: String,
+    account: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+#[derive(Deserialize)]
+struct ThreadParams {
+    account: String,
+    thread_id: String,
+}
+
+#[derive(Deserialize)]
+struct SyncParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    #[serde(default = "default_limit")]
+    limit: u32,
+    #[serde(default)]
+    backfill: u32,
+}
+
+#[derive(Deserialize)]
 struct AccountParams {
     account: String,
     #[serde(default = "default_mailbox")]
@@ -89,8 +122,21 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
                 to_json(&api.list_mailboxes(&p.account)?)
             }
             "sync" => {
-                let p: AccountParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
-                to_json(&api.sync_mailbox(&p.account, &p.mailbox, p.limit).await?)
+                let p: SyncParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                let opts = crate::sync::SyncOptions { initial_limit: p.limit, backfill: p.backfill };
+                to_json(&api.sync_mailbox_opts(&p.account, &p.mailbox, opts).await?)
+            }
+            "message.get" => {
+                let p: MessageParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.fetch_message(&p.account, &p.mailbox, p.uid).await?)
+            }
+            "search" => {
+                let p: SearchParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.search(&p.query, p.account.as_deref(), p.limit as usize)?)
+            }
+            "thread" => {
+                let p: ThreadParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.thread(&p.account, &p.thread_id)?)
             }
             "send" => {
                 let p: SendRequest = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
