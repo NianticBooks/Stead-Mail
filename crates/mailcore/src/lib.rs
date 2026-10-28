@@ -5,11 +5,13 @@
 //! No UI toolkit types leak into this crate.
 
 pub mod account;
+pub mod ai;
 pub mod api;
 pub mod body;
 pub mod caldav;
 pub mod error;
 pub mod google;
+pub mod html;
 pub mod imap;
 pub mod oauth;
 pub mod rpc;

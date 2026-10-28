@@ -19,6 +19,53 @@ Service / Keychain with an encrypted-file fallback; hybrid AI (local Ollama for 
 triage, cloud for drafting) with 100% human-in-the-loop; Google Calendar REST + iCloud CalDAV
 two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
+## Phase 4 (AI layer) — what exists
+
+Off until you turn it on (`mailcore ai enable`, or Settings → AI). Everything it produces is a proposal.
+
+- **Triage**: category (conversation, scheduling, transaction, notification, newsletter, other), needs-reply,
+  urgency and a one-line summary, shown in the list and the reading pane. Mail you wrote yourself, or that
+  sits in Sent/Drafts, never needs a reply.
+- **Events**: invitations (`.ics`) are parsed deterministically, including Windows zone names, floating times,
+  all-day dates and cancellations. Free-text dates are read by a model; each proposal must quote the sentence
+  it came from, the quote is checked against the message, the date must be plausible, past or vague sentences
+  are rejected, and weekday names are corrected in code because models get weekday arithmetic wrong.
+  Accepting a proposal puts it in the local calendar table (views and sync come in Phase 5).
+- **Drafting**: `Draft with AI` in a reply. Local by default. A cloud draft shows the exact system prompt and
+  message and only runs if its SHA-256 matches what you were shown.
+- **Local first**: Ollama (`qwen3:8b`, thinking off, JSON-schema output). Cloud (Claude Haiku for dates, Sonnet
+  for drafts) is a second switch plus an API key in the keyring; event reading sends only date-bearing sentences.
+- **Hostile mail**: messages that try to instruct an AI ("ignore previous instructions", role tags, "do not tell
+  the user") are detected deterministically, never shown to a model, labelled by code, and the user is warned.
+  Model output is validated against fixed vocabularies, and rules a model cannot be trusted with are enforced
+  in code.
+- **Audit**: every model call is logged by size only; Settings → AI and `mailcore ai audit` show what left.
+- **Evaluation**: `mailcore ai eval` scores a model on 39 tuning cases; `--holdout` uses 14 cases never tuned
+  against; `--no-guards` measures the model alone. qwen3:8b on the RTX 5060: holdout triage 87.5%, reply flag
+  100%, event recall 100% / precision 80%, injection 3/3; about 1 s per call warm.
+- Commands: `mailcore ai status|enable|disable|set|key|analyze|triage|proposals|accept|dismiss|calendar|draft|audit|eval`.
+- Not verified live: cloud calls (no API key was available), only fake-server tests cover that path.
+
+## Phase 3 (desktop GUI) — what exists
+
+- Three-pane dark UI (Svelte 5): accounts and folders with server unread counts, message list with
+  search, reading pane. Keyboard first: `j`/`k` move, `c` compose, `r` reply, `u` read/unread, `s` star,
+  `/` search, `g i` inbox, `?` help, `Esc` closes dialogs
+- HTML mail is sanitised in Rust (`mailcore::html`: scripts, forms, frames, dangerous URLs and risky CSS
+  removed), then shown in a script-free sandboxed frame under its own CSP. Remote images are blocked
+  until you load them for one message; the banner says how many were blocked
+- Compose and reply (threading headers, quoted text, attachments, Cc/Bcc) through the outbox, with a
+  discard guard; attachments save to Downloads without overwriting
+- Settings: add iCloud, Gmail or generic IMAP accounts (the connection is checked and a bad account is
+  not kept), Google Calendar sign-in, and a mark-read-on-open switch
+- Live updates: one IDLE watcher per account inbox pushes changes into the window; the shell also
+  retries queued mail every 30 s
+- The Tauri shell is a pass-through to the JSON-RPC API (`rpc` command) plus browser sign-in, safe
+  external links, reveal-in-folder and the watchers
+
+Tests: 64 Rust (core, sanitiser attack vectors, flags, paging) and 30 UI logic tests
+(`cd apps/desktop && npm test`). Not built yet: calendar views, reply-all, drafts, moving or deleting mail.
+
 ## Phase 2 (sync engine) — what exists
 
 - Incremental IMAP sync: first pass pulls the newest N, later passes fetch only new UIDs, one

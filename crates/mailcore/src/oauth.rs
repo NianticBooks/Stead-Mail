@@ -270,8 +270,8 @@ async fn token_request(client: &OAuthClient, http: &reqwest::Client, form: &[(&s
 
 #[cfg(test)]
 pub(crate) mod fake_http {
-    //! Minimal HTTP/1.1 responder for tests: one canned JSON response per accepted connection,
-    //! recording each request's target and body.
+    //! Minimal HTTP/1.1 responder for tests. Each accepted connection gets the next canned
+    //! response; every request is recorded (target, body, and the raw head including headers).
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -279,18 +279,25 @@ pub(crate) mod fake_http {
     #[derive(Default)]
     pub struct Seen {
         pub requests: Vec<(String, String)>,
+        /// The request line and headers exactly as received, one entry per request.
+        pub heads: Vec<String>,
     }
 
     pub async fn start(status: u16, json_body: &'static str, max: usize) -> (u16, Arc<Mutex<Seen>>) {
+        start_seq((0..max).map(|_| (status, json_body.to_string())).collect()).await
+    }
+
+    /// Serve `responses` in order, one per connection, then stop accepting.
+    pub async fn start_seq(responses: Vec<(u16, String)>) -> (u16, Arc<Mutex<Seen>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Seen::default()));
         let seen2 = seen.clone();
         tokio::spawn(async move {
-            for _ in 0..max {
+            for (status, json_body) in responses {
                 let (mut s, _) = listener.accept().await.unwrap();
                 let mut buf = Vec::new();
-                let mut tmp = [0u8; 2048];
+                let mut tmp = [0u8; 4096];
                 let mut content_length = 0usize;
                 loop {
                     let n = s.read(&mut tmp).await.unwrap();
@@ -307,9 +314,14 @@ pub(crate) mod fake_http {
                     }
                 }
                 let text = String::from_utf8_lossy(&buf).to_string();
+                let head = text.split("\r\n\r\n").next().unwrap_or("").to_string();
                 let target = text.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("").to_string();
                 let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-                seen2.lock().unwrap().requests.push((target, body));
+                {
+                    let mut seen = seen2.lock().unwrap();
+                    seen.requests.push((target, body));
+                    seen.heads.push(head);
+                }
                 let resp = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     json_body.len(), json_body

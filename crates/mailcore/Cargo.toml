@@ -35,6 +35,10 @@ mail-send = { version = "0.6", default-features = false, features = ["builder", 
 open = "5.4.5"
 
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "charset", "query"] }
+ammonia = "4.2.4"
+regex = "1.13.1"
+chrono-tz = "0.10.4"
+iana-time-zone = "0.1.65"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

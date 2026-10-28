@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, AuthKind, Provider, ServerConfig};
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 8;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE accounts (
@@ -149,6 +149,87 @@ CREATE TABLE outbox (
 CREATE INDEX outbox_due ON outbox(state, next_attempt_at);
 "#;
 
+/// Server-reported unread count per mailbox (NULL = unknown). Cached rows alone cannot answer this:
+/// only the newest slice of a large mailbox is stored locally.
+const MIGRATION_V6: &str = "ALTER TABLE mailboxes ADD COLUMN unseen INTEGER;";
+
+const MIGRATION_V7: &str = r#"
+ALTER TABLE messages ADD COLUMN calendar_data TEXT;
+ALTER TABLE messages ADD COLUMN ai_events_at TEXT;
+
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+CREATE TABLE ai_triage (
+    message_id     INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    category       TEXT NOT NULL,
+    needs_reply    INTEGER NOT NULL,
+    urgency        TEXT NOT NULL,
+    summary        TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    prompt_version INTEGER NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE event_proposals (
+    id          INTEGER PRIMARY KEY,
+    message_id  INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    source      TEXT NOT NULL CHECK (source IN ('ics','ai')),
+    method      TEXT,
+    ics_uid     TEXT,
+    title       TEXT NOT NULL,
+    start_utc   TEXT NOT NULL,
+    end_utc     TEXT,
+    all_day     INTEGER NOT NULL DEFAULT 0,
+    tz          TEXT,
+    location    TEXT,
+    attendees   TEXT NOT NULL DEFAULT '[]',
+    rrule       TEXT,
+    confidence  REAL,
+    quote       TEXT,
+    model       TEXT,
+    state       TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','accepted','dismissed')),
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(message_id, title, start_utc)
+);
+CREATE INDEX proposals_by_message ON event_proposals(message_id);
+
+-- Every model call, local or cloud, by size only. Message content is never stored here.
+CREATE TABLE ai_calls (
+    id        INTEGER PRIMARY KEY,
+    at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    provider  TEXT NOT NULL,
+    model     TEXT NOT NULL,
+    task      TEXT NOT NULL,
+    bytes_out INTEGER NOT NULL,
+    bytes_in  INTEGER NOT NULL,
+    millis    INTEGER NOT NULL,
+    ok        INTEGER NOT NULL,
+    error     TEXT
+);
+
+-- Events the user accepted. The calendar views and sync arrive in a later phase; this is where
+-- accepted proposals land until then.
+CREATE TABLE calendar_events (
+    id                 INTEGER PRIMARY KEY,
+    title              TEXT NOT NULL,
+    start_utc          TEXT NOT NULL,
+    end_utc            TEXT,
+    all_day            INTEGER NOT NULL DEFAULT 0,
+    tz                 TEXT,
+    location           TEXT,
+    attendees          TEXT NOT NULL DEFAULT '[]',
+    rrule              TEXT,
+    ics_uid            TEXT,
+    source_proposal_id INTEGER,
+    source_message_id  INTEGER,
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX calendar_events_by_proposal ON calendar_events(source_proposal_id) WHERE source_proposal_id IS NOT NULL;
+"#;
+
+/// Triage can flag a message that tried to instruct an AI.
+const MIGRATION_V8: &str = "ALTER TABLE ai_triage ADD COLUMN suspicious INTEGER NOT NULL DEFAULT 0;";
+
 /// An OAuth2 login (e.g. a Google account authorised for Calendar). The refresh token lives in
 /// the secret store under [`OAuthIdentity::refresh_secret_key`], never in SQLite.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,6 +262,8 @@ pub struct MailboxRow {
     pub uidnext: Option<u32>,
     pub exists_count: Option<u32>,
     pub last_synced_at: Option<String>,
+    /// Unread messages on the server as of the last sync.
+    pub unseen: Option<u32>,
 }
 
 /// A parsed message header ready to be stored. Produced by the IMAP layer.
@@ -214,6 +297,68 @@ pub struct MessageRow {
     pub preview: Option<String>,
     pub has_attachments: bool,
     pub body_cached: bool,
+    /// AI triage, when it has been run for this message.
+    pub triage: Option<TriageBrief>,
+    /// Event proposals from this message that the user has not decided about yet.
+    pub pending_events: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TriageBrief {
+    pub category: String,
+    pub needs_reply: bool,
+    pub urgency: String,
+    pub summary: String,
+    /// The message tried to give instructions to an AI.
+    pub suspicious: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventProposal {
+    pub id: i64,
+    pub message_id: i64,
+    #[serde(flatten)]
+    pub proposal: crate::ai::events::NewProposal,
+    /// pending | accepted | dismissed
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CalendarEvent {
+    pub id: i64,
+    pub title: String,
+    pub start_utc: String,
+    pub end_utc: Option<String>,
+    pub all_day: bool,
+    pub tz: Option<String>,
+    pub location: Option<String>,
+    pub attendees: Vec<String>,
+    pub rrule: Option<String>,
+    pub ics_uid: Option<String>,
+    pub source_proposal_id: Option<i64>,
+    pub source_message_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiCall {
+    pub id: i64,
+    pub at: String,
+    pub provider: String,
+    pub model: String,
+    pub task: String,
+    pub bytes_out: i64,
+    pub bytes_in: i64,
+    pub millis: i64,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiUsage {
+    pub provider: String,
+    pub calls: i64,
+    pub bytes_out: i64,
+    pub bytes_in: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,6 +455,9 @@ fn row_to_outbox(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxItem> {
 }
 
 fn msg_cols(prefix: &str) -> String {
+    // Correlated subqueries must name the outer row explicitly: an unqualified `id` would bind to
+    // the inner table when it has an `id` column of its own (event_proposals does).
+    let outer = if prefix.is_empty() { "messages.".to_string() } else { prefix.to_string() };
     [
         "id", "mailbox_id", "uid", "message_id", "in_reply_to", "references_hdr", "subject", "from_name", "from_addr",
         "to_addrs", "date", "internal_date", "size", "flags", "thread_id", "preview", "has_attachments",
@@ -319,6 +467,12 @@ fn msg_cols(prefix: &str) -> String {
     .collect::<Vec<_>>()
     .join(", ")
         + &format!(", {prefix}body_fetched_at IS NOT NULL")
+        + &format!(", (SELECT category FROM ai_triage WHERE message_id = {outer}id)")
+        + &format!(", (SELECT needs_reply FROM ai_triage WHERE message_id = {outer}id)")
+        + &format!(", (SELECT urgency FROM ai_triage WHERE message_id = {outer}id)")
+        + &format!(", (SELECT summary FROM ai_triage WHERE message_id = {outer}id)")
+        + &format!(", (SELECT suspicious FROM ai_triage WHERE message_id = {outer}id)")
+        + &format!(", (SELECT COUNT(*) FROM event_proposals WHERE event_proposals.message_id = {outer}id AND event_proposals.state = 'pending')")
 }
 
 fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
@@ -343,6 +497,17 @@ fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
         preview: r.get(15)?,
         has_attachments: r.get::<_, i64>(16)? != 0,
         body_cached: r.get::<_, i64>(17)? != 0,
+        triage: match r.get::<_, Option<String>>(18)? {
+            Some(category) => Some(TriageBrief {
+                category,
+                needs_reply: r.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0,
+                urgency: r.get::<_, Option<String>>(20)?.unwrap_or_default(),
+                summary: r.get::<_, Option<String>>(21)?.unwrap_or_default(),
+                suspicious: r.get::<_, Option<i64>>(22)?.unwrap_or(0) != 0,
+            }),
+            None => None,
+        },
+        pending_events: r.get::<_, Option<i64>>(23)?.unwrap_or(0),
     })
 }
 
@@ -409,6 +574,15 @@ impl Store {
         }
         if version < 5 {
             tx.execute_batch(MIGRATION_V5)?;
+        }
+        if version < 6 {
+            tx.execute_batch(MIGRATION_V6)?;
+        }
+        if version < 7 {
+            tx.execute_batch(MIGRATION_V7)?;
+        }
+        if version < 8 {
+            tx.execute_batch(MIGRATION_V8)?;
         }
         if version < SCHEMA_VERSION {
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -517,7 +691,7 @@ impl Store {
 
     pub fn list_mailboxes(&self, account_id: &str) -> Result<Vec<MailboxRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, account_id, name, delimiter, attributes, uidvalidity, uidnext, exists_count, last_synced_at
+            "SELECT id, account_id, name, delimiter, attributes, uidvalidity, uidnext, exists_count, last_synced_at, unseen
              FROM mailboxes WHERE account_id = ?1 ORDER BY name",
         )?;
         let rows = stmt.query_map([account_id], |r| {
@@ -531,6 +705,7 @@ impl Store {
                 uidnext: r.get(6)?,
                 exists_count: r.get(7)?,
                 last_synced_at: r.get(8)?,
+                unseen: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -551,6 +726,10 @@ impl Store {
     // ----- messages -----
 
     /// (uid, flags) of every cached message in a mailbox, ascending by uid.
+    pub fn mailbox_id_of(&self, message_id: i64) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT mailbox_id FROM messages WHERE id = ?1", [message_id], |r| r.get(0))?)
+    }
+
     pub fn local_uid_flags(&self, mailbox_id: i64) -> Result<Vec<(u32, String)>> {
         let mut stmt = self.conn.prepare("SELECT uid, flags FROM messages WHERE mailbox_id = ?1 ORDER BY uid")?;
         let rows = stmt.query_map([mailbox_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -560,13 +739,14 @@ impl Store {
     pub fn mailbox_by_id(&self, mailbox_id: i64) -> Result<MailboxRow> {
         self.conn
             .query_row(
-                "SELECT id, account_id, name, delimiter, attributes, uidvalidity, uidnext, exists_count, last_synced_at
+                "SELECT id, account_id, name, delimiter, attributes, uidvalidity, uidnext, exists_count, last_synced_at, unseen
                  FROM mailboxes WHERE id = ?1",
                 [mailbox_id],
                 |r| {
                     Ok(MailboxRow {
                         id: r.get(0)?, account_id: r.get(1)?, name: r.get(2)?, delimiter: r.get(3)?, attributes: r.get(4)?,
                         uidvalidity: r.get(5)?, uidnext: r.get(6)?, exists_count: r.get(7)?, last_synced_at: r.get(8)?,
+                        unseen: r.get(9)?,
                     })
                 },
             )
@@ -636,13 +816,48 @@ impl Store {
     }
 
     pub fn list_messages(&self, mailbox_id: i64, limit: usize) -> Result<Vec<MessageRow>> {
+        self.list_messages_page(mailbox_id, limit, 0)
+    }
+
+    pub fn list_messages_page(&self, mailbox_id: i64, limit: usize, offset: usize) -> Result<Vec<MessageRow>> {
         let sql = format!(
-            "SELECT {} FROM messages WHERE mailbox_id = ?1 ORDER BY COALESCE(date, internal_date) DESC, uid DESC LIMIT ?2",
+            "SELECT {} FROM messages WHERE mailbox_id = ?1 ORDER BY COALESCE(date, internal_date) DESC, uid DESC LIMIT ?2 OFFSET ?3",
             msg_cols("")
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![mailbox_id, limit as i64], row_to_message)?;
+        let rows = stmt.query_map(params![mailbox_id, limit as i64, offset as i64], row_to_message)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn set_mailbox_unseen(&self, mailbox_id: i64, unseen: Option<u32>) -> Result<()> {
+        self.conn.execute("UPDATE mailboxes SET unseen = ?2 WHERE id = ?1", params![mailbox_id, unseen])?;
+        Ok(())
+    }
+
+    /// Record a flag change made through this app, keeping the unread count in step without
+    /// waiting for the next sync.
+    pub fn set_local_flag(&self, mailbox_id: i64, uid: u32, flag: &str, on: bool) -> Result<String> {
+        let current: String = self
+            .conn
+            .query_row("SELECT flags FROM messages WHERE mailbox_id = ?1 AND uid = ?2", params![mailbox_id, uid], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| Error::Invalid(format!("message uid {uid} is not cached")))?;
+        let mut flags: Vec<String> = current.split_whitespace().map(String::from).collect();
+        let had = flags.iter().any(|f| f == flag);
+        if on && !had {
+            flags.push(flag.to_string());
+        } else if !on {
+            flags.retain(|f| f != flag);
+        }
+        flags.sort();
+        let new = flags.join(" ");
+        self.conn.execute("UPDATE messages SET flags = ?3 WHERE mailbox_id = ?1 AND uid = ?2", params![mailbox_id, uid, new])?;
+        if flag == "\\Seen" && had != on {
+            // Seen gained = one fewer unread; Seen lost = one more.
+            let delta: i64 = if on { -1 } else { 1 };
+            self.conn.execute("UPDATE mailboxes SET unseen = MAX(0, unseen + ?2) WHERE id = ?1 AND unseen IS NOT NULL", params![mailbox_id, delta])?;
+        }
+        Ok(new)
     }
 
     pub fn count_messages(&self, mailbox_id: i64) -> Result<i64> {
@@ -678,9 +893,9 @@ impl Store {
     pub fn set_message_body(&mut self, message_id: i64, body: &crate::body::ParsedBody) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE messages SET body_text = ?2, body_html = ?3, preview = ?4, has_attachments = ?5,
+            "UPDATE messages SET body_text = ?2, body_html = ?3, preview = ?4, has_attachments = ?5, calendar_data = ?6,
                     body_fetched_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
-            params![message_id, body.text, body.html, body.preview(), !body.attachments.is_empty() as i64],
+            params![message_id, body.text, body.html, body.preview(), !body.attachments.is_empty() as i64, body.calendar],
         )?;
         tx.execute("DELETE FROM attachments WHERE message_id = ?1", [message_id])?;
         for a in &body.attachments {
@@ -706,12 +921,211 @@ impl Store {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![q, account_id, limit as i64], |r| {
-            Ok(SearchHit { row: row_to_message(r)?, mailbox: r.get(18)?, snippet: r.get(19)? })
+            Ok(SearchHit { row: row_to_message(r)?, mailbox: r.get(24)?, snippet: r.get(25)? })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Every cached message in a thread, oldest first.
+    // ----- settings -----
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])?;
+        Ok(())
+    }
+
+    // ----- AI: triage, proposals, audit, accepted events -----
+
+    pub fn calendar_data(&self, message_id: i64) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT calendar_data FROM messages WHERE id = ?1", [message_id], |r| r.get(0))?)
+    }
+
+    pub fn ai_events_done(&self, message_id: i64) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT ai_events_at IS NOT NULL FROM messages WHERE id = ?1", [message_id], |r| r.get::<_, i64>(0))? != 0)
+    }
+
+    pub fn mark_ai_events_done(&self, message_id: i64) -> Result<()> {
+        self.conn.execute("UPDATE messages SET ai_events_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1", [message_id])?;
+        Ok(())
+    }
+
+    pub fn save_triage(&self, message_id: i64, t: &crate::ai::triage::Triage) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO ai_triage (message_id, category, needs_reply, urgency, summary, model, prompt_version, suspicious)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(message_id) DO UPDATE SET category=excluded.category, needs_reply=excluded.needs_reply, urgency=excluded.urgency,
+                 summary=excluded.summary, model=excluded.model, prompt_version=excluded.prompt_version, suspicious=excluded.suspicious,
+                 created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            params![message_id, t.category.as_str(), t.needs_reply as i64, t.urgency.as_str(), t.summary, t.model, t.prompt_version, t.suspicious as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Stored triage and the prompt version it was made with, if any.
+    pub fn triage_version(&self, message_id: i64) -> Result<Option<u32>> {
+        Ok(self.conn.query_row("SELECT prompt_version FROM ai_triage WHERE message_id = ?1", [message_id], |r| r.get(0)).optional()?)
+    }
+
+    /// Store proposals for a message. Pending proposals from the same source kinds are replaced;
+    /// proposals the user already accepted or dismissed are never touched or duplicated.
+    pub fn store_proposals(&mut self, message_id: i64, replace_sources: &[&str], new: &[crate::ai::events::NewProposal]) -> Result<Vec<EventProposal>> {
+        let tx = self.conn.transaction()?;
+        for src in replace_sources {
+            tx.execute("DELETE FROM event_proposals WHERE message_id = ?1 AND source = ?2 AND state = 'pending'", params![message_id, src])?;
+        }
+        for p in new {
+            tx.execute(
+                "INSERT OR IGNORE INTO event_proposals (message_id, source, method, ics_uid, title, start_utc, end_utc, all_day, tz, location,
+                                                        attendees, rrule, confidence, quote, model)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    message_id, p.source, p.method, p.ics_uid, p.title, p.start_utc, p.end_utc, p.all_day as i64, p.tz, p.location,
+                    serde_json::to_string(&p.attendees).map_err(|e| Error::Other(e.to_string()))?, p.rrule, p.confidence, p.quote, p.model,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        self.proposals_for_message(message_id)
+    }
+
+    fn row_to_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventProposal> {
+        let attendees: String = r.get(11)?;
+        Ok(EventProposal {
+            id: r.get(0)?,
+            message_id: r.get(1)?,
+            proposal: crate::ai::events::NewProposal {
+                source: r.get(2)?,
+                method: r.get(3)?,
+                ics_uid: r.get(4)?,
+                title: r.get(5)?,
+                start_utc: r.get(6)?,
+                end_utc: r.get(7)?,
+                all_day: r.get::<_, i64>(8)? != 0,
+                tz: r.get(9)?,
+                location: r.get(10)?,
+                attendees: serde_json::from_str(&attendees).unwrap_or_default(),
+                rrule: r.get(12)?,
+                confidence: r.get(13)?,
+                quote: r.get(14)?,
+                model: r.get(15)?,
+            },
+            state: r.get(16)?,
+        })
+    }
+
+    const PROPOSAL_COLS: &'static str =
+        "id, message_id, source, method, ics_uid, title, start_utc, end_utc, all_day, tz, location, attendees, rrule, confidence, quote, model, state";
+
+    pub fn proposals_for_message(&self, message_id: i64) -> Result<Vec<EventProposal>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM event_proposals WHERE message_id = ?1 ORDER BY start_utc, id", Self::PROPOSAL_COLS))?;
+        Ok(stmt.query_map([message_id], Self::row_to_proposal)?.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn pending_proposals(&self, account_id: Option<&str>, limit: usize) -> Result<Vec<EventProposal>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM event_proposals p WHERE state = 'pending' AND (?1 IS NULL OR message_id IN (SELECT id FROM messages WHERE account_id = ?1))
+             ORDER BY start_utc LIMIT ?2",
+            Self::PROPOSAL_COLS
+        ))?;
+        Ok(stmt.query_map(params![account_id, limit as i64], Self::row_to_proposal)?.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn get_proposal(&self, id: i64) -> Result<EventProposal> {
+        self.conn
+            .query_row(&format!("SELECT {} FROM event_proposals WHERE id = ?1", Self::PROPOSAL_COLS), [id], Self::row_to_proposal)
+            .optional()?
+            .ok_or_else(|| Error::Invalid(format!("no event proposal {id}")))
+    }
+
+    pub fn dismiss_proposal(&self, id: i64) -> Result<EventProposal> {
+        let n = self.conn.execute("UPDATE event_proposals SET state = 'dismissed' WHERE id = ?1 AND state = 'pending'", [id])?;
+        let p = self.get_proposal(id)?;
+        if n == 0 && p.state != "dismissed" {
+            return Err(Error::Invalid(format!("proposal {id} is already {}", p.state)));
+        }
+        Ok(p)
+    }
+
+    /// Accept a pending proposal: it becomes a calendar event, atomically. Cancellation notices
+    /// are information, not events to add.
+    pub fn accept_proposal(&mut self, id: i64) -> Result<CalendarEvent> {
+        let tx = self.conn.transaction()?;
+        let (state, method): (String, Option<String>) = tx
+            .query_row("SELECT state, method FROM event_proposals WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .ok_or_else(|| Error::Invalid(format!("no event proposal {id}")))?;
+        if state != "pending" {
+            return Err(Error::Invalid(format!("this proposal is already {state}")));
+        }
+        if method.as_deref() == Some("CANCEL") {
+            return Err(Error::Invalid("this is a cancellation notice, not an event to add".into()));
+        }
+        tx.execute(
+            "INSERT INTO calendar_events (title, start_utc, end_utc, all_day, tz, location, attendees, rrule, ics_uid, source_proposal_id, source_message_id)
+             SELECT title, start_utc, end_utc, all_day, tz, location, attendees, rrule, ics_uid, id, message_id FROM event_proposals WHERE id = ?1",
+            [id],
+        )?;
+        let event_id = tx.last_insert_rowid();
+        tx.execute("UPDATE event_proposals SET state = 'accepted' WHERE id = ?1", [id])?;
+        tx.commit()?;
+        self.calendar_event(event_id)
+    }
+
+    fn calendar_event(&self, id: i64) -> Result<CalendarEvent> {
+        Ok(self.conn.query_row(
+            "SELECT id, title, start_utc, end_utc, all_day, tz, location, attendees, rrule, ics_uid, source_proposal_id, source_message_id FROM calendar_events WHERE id = ?1",
+            [id],
+            Self::row_to_event,
+        )?)
+    }
+
+    fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarEvent> {
+        let attendees: String = r.get(7)?;
+        Ok(CalendarEvent {
+            id: r.get(0)?, title: r.get(1)?, start_utc: r.get(2)?, end_utc: r.get(3)?, all_day: r.get::<_, i64>(4)? != 0, tz: r.get(5)?,
+            location: r.get(6)?, attendees: serde_json::from_str(&attendees).unwrap_or_default(), rrule: r.get(8)?, ics_uid: r.get(9)?,
+            source_proposal_id: r.get(10)?, source_message_id: r.get(11)?,
+        })
+    }
+
+    pub fn list_calendar_events(&self, limit: usize) -> Result<Vec<CalendarEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, start_utc, end_utc, all_day, tz, location, attendees, rrule, ics_uid, source_proposal_id, source_message_id
+             FROM calendar_events ORDER BY start_utc LIMIT ?1",
+        )?;
+        Ok(stmt.query_map([limit as i64], Self::row_to_event)?.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn record_ai_call(&self, provider: &str, model: &str, task: &str, bytes_out: usize, bytes_in: usize, millis: u64, error: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO ai_calls (provider, model, task, bytes_out, bytes_in, millis, ok, error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![provider, model, task, bytes_out as i64, bytes_in as i64, millis as i64, error.is_none() as i64, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn ai_calls(&self, limit: usize) -> Result<Vec<AiCall>> {
+        let mut stmt = self.conn.prepare("SELECT id, at, provider, model, task, bytes_out, bytes_in, millis, ok, error FROM ai_calls ORDER BY id DESC LIMIT ?1")?;
+        Ok(stmt
+            .query_map([limit as i64], |r| {
+                Ok(AiCall { id: r.get(0)?, at: r.get(1)?, provider: r.get(2)?, model: r.get(3)?, task: r.get(4)?, bytes_out: r.get(5)?, bytes_in: r.get(6)?, millis: r.get(7)?, ok: r.get::<_, i64>(8)? != 0, error: r.get(9)? })
+            })?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Calls and bytes per provider over the last 30 days.
+    pub fn ai_usage(&self) -> Result<Vec<AiUsage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider, COUNT(*), COALESCE(SUM(bytes_out),0), COALESCE(SUM(bytes_in),0) FROM ai_calls
+             WHERE at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') GROUP BY provider ORDER BY provider",
+        )?;
+        Ok(stmt.query_map([], |r| Ok(AiUsage { provider: r.get(0)?, calls: r.get(1)?, bytes_out: r.get(2)?, bytes_in: r.get(3)? }))?.collect::<std::result::Result<_, _>>()?)
+    }
+
     // ----- outbox -----
 
     pub fn outbox_insert(&self, n: &NewOutbox<'_>) -> Result<OutboxItem> {

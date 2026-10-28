@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 
 /// Cap on stored body text so one pathological message cannot bloat the database or the index.
 const MAX_BODY_BYTES: usize = 1_000_000;
+const MAX_CALENDAR_BYTES: usize = 200_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentInfo {
@@ -23,6 +24,8 @@ pub struct ParsedBody {
     /// Raw HTML exactly as sent. It is untrusted: the UI must sanitise it before rendering.
     pub html: Option<String>,
     pub attachments: Vec<AttachmentInfo>,
+    /// Decoded text of any `text/calendar` parts (invitations), joined. Empty when there are none.
+    pub calendar: String,
 }
 
 impl ParsedBody {
@@ -35,6 +38,17 @@ impl ParsedBody {
         }
         Some(collapsed.chars().take(200).collect())
     }
+}
+
+fn truncate_bytes(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 fn truncate(mut s: String) -> String {
@@ -53,7 +67,14 @@ pub fn parse_body(raw: &[u8]) -> Result<ParsedBody> {
         .parse(raw)
         .ok_or_else(|| Error::Other("message could not be parsed as MIME".into()))?;
     let text = msg.body_text(0).map(|t| truncate(t.into_owned())).filter(|t| !t.trim().is_empty());
-    let html = msg.body_html(0).map(|h| truncate(h.into_owned())).filter(|h| !h.trim().is_empty());
+    // `body_html` also fabricates HTML from plain-text messages. Keep HTML only when the sender
+    // really sent an HTML part, so text-only mail is shown as the text it is.
+    let html = msg
+        .html_body()
+        .position(|p| matches!(p.kind(), mail_parser::PartKind::Html))
+        .and_then(|i| msg.body_html(i))
+        .map(|h| truncate(h.into_owned()))
+        .filter(|h| !h.trim().is_empty());
     let attachments = msg
         .attachments()
         .enumerate()
@@ -76,7 +97,22 @@ pub fn parse_body(raw: &[u8]) -> Result<ParsedBody> {
             }
         })
         .collect();
-    Ok(ParsedBody { text, html, attachments })
+    // Invitations arrive as a text/calendar alternative or as an attached .ics file.
+    let mut calendar = String::new();
+    for part in msg.parts() {
+        let is_cal = part.content_type().is_some_and(|c| c.ctype().eq_ignore_ascii_case("text") && c.subtype().is_some_and(|s| s.eq_ignore_ascii_case("calendar")))
+            || part.attachment_name().is_some_and(|n| n.to_ascii_lowercase().ends_with(".ics"));
+        if is_cal && calendar.len() < MAX_CALENDAR_BYTES {
+            let bytes = part.decoded();
+            let text = String::from_utf8_lossy(&bytes);
+            if text.contains("BEGIN:VCALENDAR") || text.contains("BEGIN:VEVENT") {
+                calendar.push_str(&text);
+                calendar.push('\n');
+            }
+        }
+    }
+    let calendar = truncate_bytes(calendar, MAX_CALENDAR_BYTES);
+    Ok(ParsedBody { text, html, attachments, calendar })
 }
 
 /// Decoded bytes of one attachment, addressed by the `part_index` that `parse_body` reported.
@@ -160,6 +196,30 @@ Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8gUERG\r\n--B--\r\n";
         let long = format!("{}.pdf", "x".repeat(300));
         let out = sanitize_filename(Some(&long), 0);
         assert!(out.chars().count() <= 120 && out.ends_with(".pdf"), "{out}");
+    }
+
+    #[test]
+    fn invitations_are_kept_whether_inline_or_attached() {
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:1\r\nDTSTART:20261029T193000Z\r\nSUMMARY:Dinner\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let inline = format!("From: a@example.com\r\nSubject: Invitation\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/plain\r\n\r\nYou are invited.\r\n--B\r\nContent-Type: text/calendar; method=REQUEST; charset=UTF-8\r\n\r\n{ics}--B--\r\n");
+        let b = parse_body(inline.as_bytes()).unwrap();
+        assert!(b.calendar.contains("SUMMARY:Dinner"), "{:?}", b.calendar);
+        assert!(b.text.as_deref().unwrap().contains("You are invited"));
+
+        let attached = format!("From: a@example.com\r\nSubject: Invitation\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--B\r\nContent-Type: application/ics; name=\"invite.ics\"\r\nContent-Disposition: attachment; filename=\"invite.ics\"\r\n\r\n{ics}--B--\r\n");
+        assert!(parse_body(attached.as_bytes()).unwrap().calendar.contains("UID:1"));
+        // A mail with no invitation, or an .ics that is not a calendar, leaves it empty.
+        assert_eq!(parse_body(MULTIPART.as_bytes()).unwrap().calendar, "");
+    }
+
+    #[test]
+    fn plain_text_mail_gets_no_fabricated_html() {
+        let raw = "From: a@example.com\r\nSubject: x\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nJust <b>text</b> & words\r\n";
+        let b = parse_body(raw.as_bytes()).unwrap();
+        assert_eq!(b.html, None);
+        assert!(b.text.as_deref().unwrap().contains("Just <b>text</b> & words"), "text is kept verbatim");
     }
 
     #[test]

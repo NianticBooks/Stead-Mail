@@ -22,6 +22,9 @@ pub enum Error {
     OAuth(String),
     #[error("caldav error: {0}")]
     CalDav(String),
+    /// A language-model provider failed, was unreachable, or returned something unusable.
+    #[error("ai error: {0}")]
+    Ai(String),
     #[error("secret store error: {0}")]
     Secrets(String),
     #[error("account not found: {0}")]

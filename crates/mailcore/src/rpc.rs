@@ -83,6 +83,64 @@ struct AttachmentParams {
 }
 
 #[derive(Deserialize)]
+struct ListParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    #[serde(default = "default_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+}
+
+#[derive(Deserialize)]
+struct HtmlParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    uid: u32,
+    #[serde(default)]
+    allow_remote_images: bool,
+}
+
+#[derive(Deserialize)]
+struct FlagParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    uid: u32,
+    flag: crate::api::MessageFlag,
+    on: bool,
+}
+
+#[derive(Deserialize)]
+struct AnalyzeParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    uid: u32,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Deserialize)]
+struct IdParams {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct KeyParams {
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct LimitParams {
+    account: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+#[derive(Deserialize)]
 struct SearchParams {
     query: String,
     account: Option<String>,
@@ -110,10 +168,6 @@ struct SyncParams {
 #[derive(Deserialize)]
 struct AccountParams {
     account: String,
-    #[serde(default = "default_mailbox")]
-    mailbox: String,
-    #[serde(default = "default_limit")]
-    limit: u32,
 }
 fn default_mailbox() -> String {
     "INBOX".into()
@@ -171,6 +225,61 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
                 let p: AttachmentParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.save_attachment(&p.account, &p.mailbox, p.uid, p.index, std::path::Path::new(&p.dir)).await?)
             }
+            "ai.status" => to_json(&api.ai_status().await?),
+            "ai.config" => to_json(&api.ai_config()?),
+            "ai.set_config" => {
+                let p: crate::ai::AiConfig = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_set_config(p)?)
+            }
+            "ai.set_cloud_key" => {
+                let p: KeyParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                api.ai_set_cloud_key(&p.key)?;
+                to_json(&serde_json::json!({"stored": true}))
+            }
+            "ai.clear_cloud_key" => {
+                api.ai_clear_cloud_key()?;
+                to_json(&serde_json::json!({"stored": false}))
+            }
+            "ai.analyze" => {
+                let p: AnalyzeParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_analyze(&p.account, &p.mailbox, p.uid, p.force).await?)
+            }
+            "ai.triage_folder" => {
+                let p: SyncParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_triage_folder(&p.account, &p.mailbox, p.limit as usize).await?)
+            }
+            "ai.proposals" => {
+                let p: MessageParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_proposals(&p.account, &p.mailbox, p.uid)?)
+            }
+            "ai.pending" => {
+                let p: LimitParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_pending_proposals(p.account.as_deref(), p.limit as usize)?)
+            }
+            "ai.accept" => {
+                let p: IdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_accept_proposal(p.id)?)
+            }
+            "ai.dismiss" => {
+                let p: IdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_dismiss_proposal(p.id)?)
+            }
+            "ai.draft_preview" => {
+                let p: crate::ai::pipeline::DraftRequest = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_draft_preview(&p).await?)
+            }
+            "ai.draft" => {
+                let p: crate::ai::pipeline::DraftRequest = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_draft(p).await?)
+            }
+            "ai.audit" => {
+                let p: LimitParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.ai_audit(p.limit as usize)?)
+            }
+            "calendar.events" => {
+                let p: LimitParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.calendar_events(p.limit as usize)?)
+            }
             "message.get" => {
                 let p: MessageParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.fetch_message(&p.account, &p.mailbox, p.uid).await?)
@@ -201,9 +310,23 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
                 to_json(&api.google_logout(&p.account)?)
             }
             "messages.list" => {
-                let p: AccountParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
-                to_json(&api.list_messages(&p.account, &p.mailbox, p.limit as usize)?)
+                let p: ListParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.list_messages_page(&p.account, &p.mailbox, p.limit as usize, p.offset as usize)?)
             }
+            "message.html" => {
+                let p: HtmlParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.message_html(&p.account, &p.mailbox, p.uid, p.allow_remote_images).await?)
+            }
+            "message.set_flag" => {
+                let p: FlagParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.set_flag(&p.account, &p.mailbox, p.uid, p.flag, p.on).await?)
+            }
+            "google.configure" => {
+                let p: crate::google::ClientConfig = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                api.google_configure(p)?;
+                to_json(&serde_json::json!({"configured": true}))
+            }
+            "google.configured" => to_json(&serde_json::json!({"configured": api.google_client_config().is_ok()})),
             other => Err(Error::Invalid(format!("unknown method '{other}'"))),
         }
     }

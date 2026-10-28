@@ -227,6 +227,20 @@ pub async fn fetch_raw<T: ImapStream>(session: &mut Session<T>, uid: u32) -> Res
     Ok(fetches.iter().find(|f| f.uid == Some(uid)).and_then(|f| f.body().map(|b| b.to_vec())))
 }
 
+/// Server-side unread count via STATUS. `None` when the server refuses it (some do for the
+/// selected mailbox); the caller then simply has no count rather than a wrong one.
+pub async fn unseen_count<T: ImapStream>(session: &mut Session<T>, mailbox: &str) -> Option<u32> {
+    session.status(mailbox, "(UNSEEN)").await.ok().and_then(|m| m.unseen)
+}
+
+/// Add or remove one flag (`\Seen`, `\Flagged`) on a message. SILENT: no echo is wanted.
+pub async fn store_flag<T: ImapStream>(session: &mut Session<T>, uid: u32, flag: &str, add: bool) -> Result<()> {
+    let sign = if add { '+' } else { '-' };
+    let stream = session.uid_store(uid.to_string(), format!("{sign}FLAGS.SILENT ({flag})")).await?;
+    let _: Vec<Fetch> = stream.try_collect().await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleOutcome {
     /// The server pushed something (new mail, flag change, expunge). Re-sync.
@@ -413,6 +427,32 @@ pub(crate) mod fake_server {
                                     }
                                 }
                                 format!("{out}{tag} OK FETCH completed\r\n")
+                            }
+                            "UID STORE" => {
+                                // args: "<uid> +FLAGS.SILENT (\\Seen)"
+                                let mut it = args.splitn(3, ' ');
+                                let uid: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                                let op = it.next().unwrap_or("").to_ascii_uppercase();
+                                let flags: Vec<String> = it.next().unwrap_or("").trim_matches(|c| c == '(' || c == ')').split_whitespace().map(String::from).collect();
+                                let mut st = state.lock().unwrap();
+                                if let Some(m) = st.msgs.iter_mut().find(|m| m.uid == uid) {
+                                    let mut cur: Vec<String> = m.flags.split_whitespace().map(String::from).collect();
+                                    for f in flags {
+                                        if op.starts_with('+') {
+                                            if !cur.contains(&f) { cur.push(f); }
+                                        } else {
+                                            cur.retain(|c| *c != f);
+                                        }
+                                    }
+                                    m.flags = cur.join(" ");
+                                }
+                                format!("{tag} OK STORE completed\r\n")
+                            }
+                            "STATUS" => {
+                                let st = state.lock().unwrap();
+                                let unseen = st.msgs.iter().filter(|m| !m.flags.contains("Seen")).count();
+                                let name = args.split_whitespace().next().unwrap_or("INBOX").trim_matches('"').to_string();
+                                format!("* STATUS \"{name}\" (UNSEEN {unseen})\r\n{tag} OK STATUS completed\r\n")
                             }
                             "UID SEARCH" => {
                                 let st = state.lock().unwrap();

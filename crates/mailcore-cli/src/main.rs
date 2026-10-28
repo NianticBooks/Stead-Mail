@@ -136,6 +136,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GoogleCmd,
     },
+    /// AI features: triage, event proposals, drafting, evaluation. Off until you enable them.
+    Ai {
+        #[command(subcommand)]
+        cmd: AiCmd,
+    },
     /// Run the JSON-RPC 2.0 daemon: on stdio by default, or on a Unix socket with --socket.
     Serve {
         /// Listen on the default Unix socket ($XDG_RUNTIME_DIR/mailcore.sock) instead of stdio.
@@ -145,6 +150,115 @@ enum Cmd {
         #[arg(long, conflicts_with = "socket")]
         socket_path: Option<std::path::PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum AiCmd {
+    /// Show settings, whether Ollama and the model are reachable, and what has been sent where.
+    Status,
+    /// Turn AI features on (local model only until you also enable cloud use).
+    Enable,
+    Disable,
+    /// Change settings. Only the options you pass are changed.
+    Set {
+        #[arg(long)]
+        ollama_url: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        num_ctx: Option<u32>,
+        /// IANA zone for times without one, e.g. America/Chicago.
+        #[arg(long)]
+        timezone: Option<String>,
+        /// local | cloud
+        #[arg(long)]
+        extract_provider: Option<String>,
+        /// local | cloud
+        #[arg(long)]
+        draft_provider: Option<String>,
+        /// on | off. Cloud models are never used while this is off.
+        #[arg(long)]
+        cloud: Option<String>,
+    },
+    /// Store or remove the Anthropic API key (read from stdin, kept in the system keyring).
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
+    },
+    /// Triage one message and look for events in it.
+    Analyze {
+        account: String,
+        uid: u32,
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Analyse the newest messages of a folder that have not been analysed.
+    Triage {
+        account: String,
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// List event proposals waiting for a decision.
+    Proposals {
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Accept a proposal: it becomes a calendar event.
+    Accept { id: i64 },
+    Dismiss { id: i64 },
+    /// Events you have accepted.
+    Calendar,
+    /// Draft a reply. Local by default. For --provider cloud it shows exactly what would be sent and
+    /// only sends it when you repeat the command with --confirm <hash>.
+    Draft {
+        account: String,
+        uid: u32,
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        #[arg(long, default_value = "")]
+        instruction: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        confirm: Option<String>,
+    },
+    /// Every model call by size, and what has left this computer.
+    Audit {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Score a model on the built-in evaluation cases (triage, events, prompt injection).
+    Eval {
+        #[arg(long, default_value = "local")]
+        provider: String,
+        #[arg(long)]
+        model: Option<String>,
+        /// triage | events | inject
+        #[arg(long)]
+        only: Option<String>,
+        /// Use cases from this JSONL file instead of the built-in set.
+        #[arg(long)]
+        cases: Option<std::path::PathBuf>,
+        /// Show every case, not just the failures.
+        #[arg(long)]
+        verbose: bool,
+        /// Switch the deterministic injection guard off, to measure the model on its own.
+        #[arg(long)]
+        no_guards: bool,
+        /// Run the holdout set (cases that prompts were never tuned against) instead.
+        #[arg(long)]
+        holdout: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    Set,
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -459,6 +573,7 @@ async fn main() -> Result<()> {
             }),
             GoogleCmd::Logout { account } => out(cli.json, &api.google_logout(&account)?, |i| println!("removed {} and its stored tokens", i.email)),
         },
+        Cmd::Ai { cmd } => ai_command(&api, cmd, cli.json).await?,
         Cmd::Serve { socket, socket_path } => {
             let path = socket_path.or_else(|| socket.then(mailcore::socket_path));
             match path {
@@ -483,6 +598,157 @@ async fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn parse_provider(s: &str) -> Result<mailcore::ai::Provider> {
+    match s.to_ascii_lowercase().as_str() {
+        "local" => Ok(mailcore::ai::Provider::Local),
+        "cloud" => Ok(mailcore::ai::Provider::Cloud),
+        other => anyhow::bail!("unknown provider '{other}' (use local or cloud)"),
+    }
+}
+
+fn fmt_ratio(r: mailcore::ai::eval::Ratio) -> String {
+    format!("{:>5.1}%  ({}/{})", r.pct(), r.good, r.total)
+}
+
+async fn ai_command(api: &Api, cmd: AiCmd, json: bool) -> Result<()> {
+    use mailcore::ai::Provider;
+    match cmd {
+        AiCmd::Status => okout(json, &api.ai_status().await?, |s| {
+            let c = &s.config;
+            println!("AI features:   {}", if c.enabled { "ON" } else { "off" });
+            println!("Cloud models:  {} (key {})", if c.cloud_enabled { "ENABLED" } else { "off" }, if s.cloud_key_present { "stored" } else { "not set" });
+            println!("Local model:   {} at {} -> {}", c.local_model, c.ollama_url,
+                match (s.local.reachable, s.local.model_installed) {
+                    (false, _) => format!("NOT REACHABLE ({})", s.local.error.clone().unwrap_or_default()),
+                    (true, false) => format!("reachable, but the model is not installed (installed: {})", s.local.installed_models.join(", ")),
+                    (true, true) => "ready".to_string(),
+                });
+            println!("Providers:     events -> {}, drafts -> {}   time zone {}", c.extract_provider.as_str(), c.draft_provider.as_str(), c.tz().name());
+            if s.usage.is_empty() {
+                println!("Usage (30 d):  no model calls yet");
+            }
+            for u in &s.usage {
+                println!("Usage (30 d):  {:<5} {} calls, {} bytes sent, {} bytes received", u.provider, u.calls, u.bytes_out, u.bytes_in);
+            }
+        }),
+        AiCmd::Enable | AiCmd::Disable => {
+            let mut c = api.ai_config()?;
+            c.enabled = matches!(cmd, AiCmd::Enable);
+            api.ai_set_config(c.clone())?;
+            println!("AI features are now {}.", if c.enabled { "on (local model only unless you enable cloud use)" } else { "off" });
+            Ok(())
+        }
+        AiCmd::Set { ollama_url, model, num_ctx, timezone, extract_provider, draft_provider, cloud } => {
+            let mut c = api.ai_config()?;
+            if let Some(v) = ollama_url { c.ollama_url = v; }
+            if let Some(v) = model { c.local_model = v; }
+            if let Some(v) = num_ctx { c.num_ctx = v; }
+            if let Some(v) = timezone { c.timezone = v; }
+            if let Some(v) = extract_provider { c.extract_provider = parse_provider(&v)?; }
+            if let Some(v) = draft_provider { c.draft_provider = parse_provider(&v)?; }
+            if let Some(v) = cloud {
+                c.cloud_enabled = match v.as_str() { "on" => true, "off" => false, _ => anyhow::bail!("--cloud takes on or off") };
+            }
+            let saved = api.ai_set_config(c)?;
+            okout(json, &saved, |_| println!("settings saved"))
+        }
+        AiCmd::Key { cmd: KeyCmd::Set } => {
+            let mut k = String::new();
+            std::io::stdin().read_line(&mut k)?;
+            api.ai_set_cloud_key(k.trim())?;
+            println!("API key stored in the system keyring. Cloud models still stay off until: mailcore ai set --cloud on");
+            Ok(())
+        }
+        AiCmd::Key { cmd: KeyCmd::Clear } => {
+            api.ai_clear_cloud_key()?;
+            println!("API key removed.");
+            Ok(())
+        }
+        AiCmd::Analyze { account, uid, mailbox, force } => okout(json, &api.ai_analyze(&account, &mailbox, uid, force).await?, |a| {
+            match &a.message.triage {
+                Some(t) => println!("{} | reply needed: {} | urgency: {}\n{}", t.category, if t.needs_reply { "yes" } else { "no" }, t.urgency, t.summary),
+                None => println!("(no triage)"),
+            }
+            for p in &a.proposals {
+                let q = &p.proposal;
+                println!("  [{}] #{} {} -> {}{}{}", p.state, p.id, q.title, q.start_utc, q.location.as_ref().map(|l| format!(" @ {l}")).unwrap_or_default(),
+                    match q.source.as_str() { "ics" => "  (invitation)".to_string(), _ => format!("  (AI, confidence {:.0}%)", q.confidence.unwrap_or(0.0) * 100.0) });
+            }
+            for e in &a.errors {
+                println!("  ! {e}");
+            }
+        }),
+        AiCmd::Triage { account, mailbox, limit } => okout(json, &api.ai_triage_folder(&account, &mailbox, limit as usize).await?, |r| {
+            println!("analysed {}, already done {}, failed {}{}", r.analyzed, r.skipped, r.failed, if r.stopped_early { " (stopped: the model is not reachable)" } else { "" });
+            for e in r.errors.iter().take(5) { println!("  ! {e}"); }
+        }),
+        AiCmd::Proposals { account } => okout(json, &api.ai_pending_proposals(account.as_deref(), 100)?, |l| {
+            if l.is_empty() { println!("no proposals waiting"); }
+            for p in l {
+                let q = &p.proposal;
+                println!("#{:<4} {:<28.28} {}  {}", p.id, q.title, q.start_utc, if q.method.as_deref() == Some("CANCEL") { "CANCELLATION" } else if q.source == "ics" { "invitation" } else { "AI" });
+            }
+        }),
+        AiCmd::Accept { id } => okout(json, &api.ai_accept_proposal(id)?, |e| println!("added to your calendar: {} at {}", e.title, e.start_utc)),
+        AiCmd::Dismiss { id } => okout(json, &api.ai_dismiss_proposal(id)?, |p| println!("dismissed #{}", p.id)),
+        AiCmd::Calendar => okout(json, &api.calendar_events(200)?, |l| {
+            if l.is_empty() { println!("no accepted events yet"); }
+            for e in l { println!("{}  {}{}", e.start_utc, e.title, e.location.as_ref().map(|x| format!(" @ {x}")).unwrap_or_default()); }
+        }),
+        AiCmd::Draft { account, uid, mailbox, instruction, provider, confirm } => {
+            let provider = provider.map(|p| parse_provider(&p)).transpose()?;
+            let req = mailcore::ai::pipeline::DraftRequest { account, mailbox, uid, instruction, existing_draft: String::new(), provider, confirm_hash: confirm.clone() };
+            if provider == Some(Provider::Cloud) && confirm.is_none() {
+                match api.ai_draft_preview(&req).await? {
+                    Some(p) => {
+                        println!("This would send {} bytes to {}:\n\n--- system ---\n{}\n\n--- message ---\n{}\n\n", p.bytes, p.model, p.system, p.user);
+                        println!("To send exactly this, run the same command again with:\n  --confirm {}", p.hash);
+                        return Ok(());
+                    }
+                    None => {}
+                }
+            }
+            okout(json, &api.ai_draft(req).await?, |d| println!("{}\n\n[{} · {} · {} ms]", d.draft, d.provider.as_str(), d.model, d.millis))
+        }
+        AiCmd::Audit { limit } => okout(json, &api.ai_audit(limit as usize)?, |a| {
+            for u in &a.usage { println!("{:<5} {} calls, {} bytes sent, {} bytes received (30 days)", u.provider, u.calls, u.bytes_out, u.bytes_in); }
+            for c in &a.calls {
+                println!("{}  {:<5} {:<18} {:<8} out {:>6} in {:>5} {:>5} ms {}", c.at, c.provider, c.model, c.task, c.bytes_out, c.bytes_in, c.millis, if c.ok { "" } else { "FAILED" });
+            }
+        }),
+        AiCmd::Eval { provider, model, only, cases, verbose, no_guards, holdout } => {
+            let cases = match cases {
+                None if holdout => Some(mailcore::ai::eval::holdout_cases()),
+                Some(path) => Some(std::fs::read_to_string(&path)?.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<std::result::Result<Vec<mailcore::ai::eval::Case>, _>>()?),
+                None => None,
+            };
+            let provider = parse_provider(&provider)?;
+            eprintln!("evaluating {} ... (a cold model load takes a few seconds)", model.as_deref().unwrap_or("the configured model"));
+            let r = api.ai_eval(provider, model.as_deref(), only.as_deref(), cases, !no_guards).await?;
+            okout(json, &r, |r| {
+                println!("model {} ({})  {} cases  guards {}", r.model, r.provider, r.results.len(), if r.guards { "on" } else { "OFF" });
+                println!("  triage category    {}", fmt_ratio(r.triage_category));
+                println!("  needs-reply flag   {}", fmt_ratio(r.triage_needs_reply));
+                println!("  event cases        {}", fmt_ratio(r.event_cases));
+                println!("  event recall       {}", fmt_ratio(r.event_recall));
+                println!("  event precision    {}", fmt_ratio(r.event_precision));
+                println!("  injection resisted {}", fmt_ratio(r.injection_resisted));
+                println!("  unusable answers   {}    latency mean {} ms, p95 {} ms", r.bad_answers, r.mean_millis, r.p95_millis);
+                for c in &r.results {
+                    if verbose || !c.passed {
+                        println!("  {} {:<22} {:>6} ms {}", if c.passed { "ok  " } else { "FAIL" }, c.id, c.millis, c.notes.join("; "));
+                    }
+                }
+            })
+        }
+    }
+}
+
+fn okout<T: serde::Serialize>(json: bool, v: &T, human: impl FnOnce(&T)) -> Result<()> {
+    out(json, v, human);
     Ok(())
 }
 
