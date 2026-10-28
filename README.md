@@ -19,6 +19,20 @@ Service / Keychain with an encrypted-file fallback; hybrid AI (local Ollama for 
 triage, cloud for drafting) with 100% human-in-the-loop; Google Calendar REST + iCloud CalDAV
 two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
+## Phase 1 (auth + daemon) — what exists
+
+- `mailcore account test` now checks IMAP and SMTP logins; `mailcore send` sends plain text
+- `mailcore caldav ACCOUNT` discovers CalDAV calendars (iCloud reuses the app-specific password)
+- `mailcore google configure|login|accounts|calendars|logout`: OAuth2 PKCE with a loopback
+  redirect, Calendar scopes only (no CASA audit), refresh token kept in the secret store
+- `mailcore serve --socket` runs the JSON-RPC daemon on `$XDG_RUNTIME_DIR/mailcore.sock` (mode 0600)
+- SQLite schema v2 adds `oauth_identities`; migrations are applied in order on open
+
+Google setup: Google Cloud Console → create a *Desktop app* OAuth client, enable the Google
+Calendar API, add yourself as a test user, then
+`mailcore google configure --client-id ID --client-secret-stdin` and `mailcore google login`.
+Note: apps in Testing mode have refresh tokens that expire after 7 days.
+
 ## Phase 0 (spike) — what exists
 
 - `mailcore account add|list|remove|test`, `mailcore sync`, `mailcore messages`, `mailcore serve`

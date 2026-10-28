@@ -42,8 +42,59 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Run the JSON-RPC 2.0 daemon over stdio (one request per line).
-    Serve,
+    /// Send a plain-text message through an account's SMTP server.
+    Send {
+        account: String,
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        #[arg(long)]
+        subject: String,
+        /// Message body. Use --body-stdin to read it from stdin instead.
+        #[arg(long, default_value = "")]
+        body: String,
+        #[arg(long)]
+        body_stdin: bool,
+    },
+    /// List the CalDAV calendars of an account (iCloud reuses the app-specific password).
+    Caldav { account: String },
+    /// Google Calendar login (OAuth2, Calendar scopes only).
+    Google {
+        #[command(subcommand)]
+        cmd: GoogleCmd,
+    },
+    /// Run the JSON-RPC 2.0 daemon: on stdio by default, or on a Unix socket with --socket.
+    Serve {
+        /// Listen on the default Unix socket ($XDG_RUNTIME_DIR/mailcore.sock) instead of stdio.
+        #[arg(long)]
+        socket: bool,
+        /// Listen on this Unix socket path instead of stdio.
+        #[arg(long, conflicts_with = "socket")]
+        socket_path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GoogleCmd {
+    /// Store the OAuth client (a 'Desktop app' client from Google Cloud Console).
+    Configure {
+        #[arg(long)]
+        client_id: String,
+        /// Read the client secret from stdin instead of the command line.
+        #[arg(long)]
+        client_secret_stdin: bool,
+        #[arg(long)]
+        client_secret: Option<String>,
+    },
+    /// Open the browser, sign in, and store the refresh token in the secret store.
+    Login {
+        /// Print the URL instead of opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    Accounts,
+    /// List calendars for a signed-in Google account (email or id).
+    Calendars { account: String },
+    Logout { account: String },
 }
 
 #[derive(Subcommand)]
@@ -128,9 +179,13 @@ async fn main() -> Result<()> {
             }),
             AccountCmd::Remove { account } => out(cli.json, &api.remove_account(&account)?, |a| println!("removed {} <{}>", a.name, a.email)),
             AccountCmd::Test { account } => out(cli.json, &api.test_connection(&account).await?, |r| {
-                println!("login OK to {} for account '{}'; {} mailboxes:", r.imap_host, r.account, r.mailboxes.len());
+                println!("IMAP login OK to {} for account '{}'; {} mailboxes:", r.imap_host, r.account, r.mailboxes.len());
                 for m in &r.mailboxes {
                     println!("  {}", m.name);
+                }
+                match &r.smtp_error {
+                    None => println!("SMTP login OK to {}", r.smtp_host),
+                    Some(e) => println!("SMTP login FAILED to {}: {e}", r.smtp_host),
                 }
             }),
         },
@@ -150,7 +205,78 @@ async fn main() -> Result<()> {
                 println!("{:>6}  {:<25.25}  {:<28.28}  {}", h.uid, date, from, h.subject.clone().unwrap_or_else(|| "(no subject)".into()));
             }
         }),
-        Cmd::Serve => mailcore::rpc::serve_stdio(&api).await?,
+        Cmd::Send { account, to, subject, body, body_stdin } => {
+            let body = if body_stdin {
+                let mut b = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut b)?;
+                b
+            } else {
+                body
+            };
+            let r = api.send_text(mailcore::api::SendRequest { account, to, subject, body }).await?;
+            out(cli.json, &r, |r| println!("sent from {} to {} via {}", r.from, r.to.join(", "), r.smtp_host))
+        }
+        Cmd::Caldav { account } => out(cli.json, &api.caldav_calendars(&account).await?, |r| {
+            println!("CalDAV home: {}", r.home.home);
+            for c in &r.calendars {
+                let kinds = match (c.supports_events, c.supports_todos) {
+                    (true, true) => "events+todos",
+                    (true, false) => "events",
+                    (false, true) => "todos",
+                    _ => "?",
+                };
+                println!("  {:<28} {:<13} {}", c.display_name, kinds, c.href);
+            }
+        }),
+        Cmd::Google { cmd } => match cmd {
+            GoogleCmd::Configure { client_id, client_secret_stdin, client_secret } => {
+                let secret = if client_secret_stdin {
+                    let mut l = String::new();
+                    std::io::stdin().read_line(&mut l)?;
+                    Some(l.trim().to_string())
+                } else {
+                    client_secret
+                }
+                .filter(|s| !s.is_empty());
+                api.google_configure(mailcore::google::ClientConfig { client_id, client_secret: secret })?;
+                println!("Google OAuth client stored in the secret store.");
+            }
+            GoogleCmd::Login { no_browser } => {
+                let id = api
+                    .google_login(|url| {
+                        eprintln!("Open this URL to sign in (waiting up to 5 minutes):\n\n{url}\n");
+                        if !no_browser {
+                            let _ = open::that_detached(url);
+                        }
+                    })
+                    .await?;
+                out(cli.json, &id, |i| println!("signed in as {} ({} scopes); refresh token stored in the secret store", i.email, i.scopes.len()))
+            }
+            GoogleCmd::Accounts => out(cli.json, &api.google_identities()?, |l| {
+                if l.is_empty() {
+                    println!("no Google accounts. run: mailcore google login");
+                }
+                for i in l {
+                    println!("{:<32} id {}", i.email, i.id);
+                }
+            }),
+            GoogleCmd::Calendars { account } => out(cli.json, &api.google_calendars(&account).await?, |l| {
+                for c in l {
+                    println!("{:<34} {:<8} {}{}", c.summary, c.access_role, c.id, if c.primary { "  (primary)" } else { "" });
+                }
+            }),
+            GoogleCmd::Logout { account } => out(cli.json, &api.google_logout(&account)?, |i| println!("removed {} and its stored tokens", i.email)),
+        },
+        Cmd::Serve { socket, socket_path } => {
+            let path = socket_path.or_else(|| socket.then(mailcore::socket_path));
+            match path {
+                None => mailcore::rpc::serve_stdio(&api).await?,
+                Some(p) => {
+                    eprintln!("mailcore daemon listening on {}", p.display());
+                    mailcore::rpc::serve_unix(std::sync::Arc::new(api), &p).await?
+                }
+            }
+        }
     }
     Ok(())
 }

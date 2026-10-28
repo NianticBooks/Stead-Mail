@@ -10,6 +10,14 @@ pub enum Error {
     Imap(#[from] async_imap::error::Error),
     #[error("tls error: {0}")]
     Tls(String),
+    #[error("smtp error: {0}")]
+    Smtp(String),
+    #[error("http error: {0}")]
+    Http(String),
+    #[error("oauth error: {0}")]
+    OAuth(String),
+    #[error("caldav error: {0}")]
+    CalDav(String),
     #[error("secret store error: {0}")]
     Secrets(String),
     #[error("account not found: {0}")]
@@ -23,6 +31,12 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
+        Error::Http(e.to_string())
+    }
+}
 
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {

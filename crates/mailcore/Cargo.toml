@@ -27,6 +27,14 @@ getrandom = "0.3"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 uuid = { version = "1.29.0", features = ["v4"] }
 chrono = { version = "0.4.45", features = ["serde"] }
+sha2 = "0.11.1"
+base64 = "0.23.1"
+url = "2.5.8"
+roxmltree = "0.21.2"
+mail-send = { version = "0.6", default-features = false, features = ["builder", "tls12"] }
+open = "5.4.5"
+
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "charset", "query"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

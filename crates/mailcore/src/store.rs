@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, AuthKind, Provider, ServerConfig};
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE accounts (
@@ -62,6 +62,39 @@ CREATE TABLE messages (
 CREATE INDEX messages_by_mailbox_date ON messages(mailbox_id, date DESC);
 CREATE INDEX messages_by_message_id ON messages(message_id);
 "#;
+
+const MIGRATION_V2: &str = r#"
+CREATE TABLE oauth_identities (
+    id         TEXT PRIMARY KEY,
+    provider   TEXT NOT NULL,
+    email      TEXT NOT NULL,
+    scopes     TEXT NOT NULL,
+    client_id  TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(provider, email)
+);
+"#;
+
+/// An OAuth2 login (e.g. a Google account authorised for Calendar). The refresh token lives in
+/// the secret store under [`OAuthIdentity::refresh_secret_key`], never in SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthIdentity {
+    pub id: String,
+    pub provider: String,
+    pub email: String,
+    pub scopes: Vec<String>,
+    pub client_id: String,
+    pub created_at: String,
+}
+
+impl OAuthIdentity {
+    pub fn refresh_secret_key(&self) -> String {
+        format!("oauth/{}/refresh_token", self.id)
+    }
+    pub fn access_secret_key(&self) -> String {
+        format!("oauth/{}/access_token", self.id)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxRow {
@@ -129,12 +162,17 @@ impl Store {
 
     fn migrate(&mut self) -> Result<()> {
         let version: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let tx = self.conn.transaction()?;
         if version < 1 {
-            let tx = self.conn.transaction()?;
             tx.execute_batch(MIGRATION_V1)?;
-            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
-            tx.commit()?;
         }
+        if version < 2 {
+            tx.execute_batch(MIGRATION_V2)?;
+        }
+        if version < SCHEMA_VERSION {
+            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -174,6 +212,42 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| Error::AccountNotFound(key.to_string()))
+    }
+
+    // ----- oauth identities -----
+
+    pub fn upsert_oauth_identity(&self, id: &OAuthIdentity) -> Result<OAuthIdentity> {
+        self.conn.execute(
+            "INSERT INTO oauth_identities (id, provider, email, scopes, client_id) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(provider, email) DO UPDATE SET scopes = excluded.scopes, client_id = excluded.client_id",
+            params![id.id, id.provider, id.email, id.scopes.join(" "), id.client_id],
+        )?;
+        self.find_oauth_identity(&id.provider, &id.email)
+    }
+
+    pub fn list_oauth_identities(&self, provider: &str) -> Result<Vec<OAuthIdentity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, provider, email, scopes, client_id, created_at FROM oauth_identities WHERE provider = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([provider], row_to_identity)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Look up by id or by email (case-insensitive).
+    pub fn find_oauth_identity(&self, provider: &str, key: &str) -> Result<OAuthIdentity> {
+        self.conn
+            .query_row(
+                "SELECT id, provider, email, scopes, client_id, created_at FROM oauth_identities
+                 WHERE provider = ?1 AND (id = ?2 OR lower(email) = lower(?2)) LIMIT 1",
+                params![provider, key],
+                row_to_identity,
+            )
+            .optional()?
+            .ok_or_else(|| Error::AccountNotFound(format!("{provider} identity '{key}'")))
+    }
+
+    pub fn delete_oauth_identity(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM oauth_identities WHERE id = ?1", [id])? > 0)
     }
 
     // ----- mailboxes -----
@@ -304,6 +378,18 @@ fn auth_str(a: AuthKind) -> &'static str {
     }
 }
 
+fn row_to_identity(r: &rusqlite::Row<'_>) -> rusqlite::Result<OAuthIdentity> {
+    let scopes: String = r.get(3)?;
+    Ok(OAuthIdentity {
+        id: r.get(0)?,
+        provider: r.get(1)?,
+        email: r.get(2)?,
+        scopes: scopes.split_whitespace().map(String::from).collect(),
+        client_id: r.get(4)?,
+        created_at: r.get(5)?,
+    })
+}
+
 fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     let provider: String = r.get("provider")?;
     let auth: String = r.get("auth")?;
@@ -341,6 +427,23 @@ mod tests {
         assert_eq!(s.find_account("icloud").unwrap().id, a.id);
         assert_eq!(s.find_account("FRED@ICLOUD.COM").unwrap().id, a.id);
         assert!(matches!(s.find_account("nope"), Err(Error::AccountNotFound(_))));
+    }
+
+    #[test]
+    fn oauth_identity_upsert_is_keyed_by_email() {
+        let s = Store::open_in_memory().unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let a = OAuthIdentity { id: "id1".into(), provider: "google".into(), email: "Fred@gmail.com".into(), scopes: vec!["a".into()], client_id: "c".into(), created_at: String::new() };
+        let stored = s.upsert_oauth_identity(&a).unwrap();
+        assert_eq!(stored.id, "id1");
+        let b = OAuthIdentity { id: "id2".into(), scopes: vec!["a".into(), "b".into()], ..a.clone() };
+        let again = s.upsert_oauth_identity(&b).unwrap();
+        assert_eq!(again.id, "id1", "same email keeps the original id");
+        assert_eq!(again.scopes, vec!["a", "b"]);
+        assert_eq!(s.list_oauth_identities("google").unwrap().len(), 1);
+        assert_eq!(s.find_oauth_identity("google", "fred@GMAIL.com").unwrap().id, "id1");
+        assert!(s.delete_oauth_identity("id1").unwrap());
     }
 
     #[test]
