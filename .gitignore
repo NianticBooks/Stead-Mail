@@ -1,0 +1,10 @@
+/target
+node_modules
+/apps/desktop/build
+/apps/desktop/.svelte-kit
+/apps/desktop/src-tauri/gen/schemas
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env

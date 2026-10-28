@@ -1,0 +1,43 @@
+/* Dark-mode-first design tokens. Light mode is a later, deliberate addition. */
+:root {
+  color-scheme: dark;
+  --bg-0: #0f1115;
+  --bg-1: #161920;
+  --bg-2: #1e222b;
+  --bg-3: #262b36;
+  --line: #2e3440;
+  --fg-0: #e6e9ef;
+  --fg-1: #aab2c0;
+  --fg-2: #6f7a8b;
+  --accent: #7aa2f7;
+  --accent-2: #9ece6a;
+  --warn: #e0af68;
+  --danger: #f7768e;
+  --radius: 8px;
+  --font-ui: "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrainsMono Nerd Font", "JetBrains Mono", ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg-0);
+  color: var(--fg-0);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+button {
+  font: inherit;
+  color: var(--fg-0);
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: default; }
+code, pre { font-family: var(--font-mono); font-size: 12.5px; }
+::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); }
