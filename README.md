@@ -30,8 +30,16 @@ two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 - `mailcore search QUERY` is FTS5 full text over cached subjects, addresses and downloaded bodies
 - Conversation threading from In-Reply-To/References (`mailcore thread`), stable under any
   arrival order; schema v4
-- Not yet: SMTP outbox with retry, attachment download, sync of folders other than the one asked
-  for, POP3 (deprioritised)
+- Outbox: `mailcore send` builds the message once (To/Cc/Bcc, reply headers, attachments), stores it,
+  and delivers; temporary failures retry at 1 min, 5 min, 15 min, 1 h, 6 h, 12 h, 24 h and give up after
+  8 attempts, while rejections and bad credentials fail at once. `mailcore outbox list|flush|run|retry|cancel`;
+  the daemon (`serve --socket`) flushes every 30 s. Bcc never appears in the message. Attachments are
+  read when queued. Claiming an item before sending stops two processes double-sending.
+- `mailcore attachment ACCOUNT UID INDEX --dir D` saves an attachment with a sanitised name and
+  never overwrites; `mailcore sync ACCOUNT --all` covers every folder except Trash, Junk, All Mail and
+  virtual views
+- Not yet: copying sent mail into the Sent folder (Gmail does it itself; iCloud does not), watching
+  several folders at once, POP3 (deprioritised)
 
 ## Phase 1 (auth + daemon) — what exists
 

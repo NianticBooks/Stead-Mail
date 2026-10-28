@@ -79,6 +79,42 @@ pub fn parse_body(raw: &[u8]) -> Result<ParsedBody> {
     Ok(ParsedBody { text, html, attachments })
 }
 
+/// Decoded bytes of one attachment, addressed by the `part_index` that `parse_body` reported.
+pub fn extract_attachment(raw: &[u8], part_index: i64) -> Result<Option<(AttachmentInfo, Vec<u8>)>> {
+    let msg = mail_parser::MessageParser::default()
+        .parse(raw)
+        .ok_or_else(|| Error::Other("message could not be parsed as MIME".into()))?;
+    let infos = parse_body(raw)?.attachments;
+    let Some(info) = infos.into_iter().find(|a| a.part_index == part_index) else { return Ok(None) };
+    let part = msg.attachments().nth(part_index as usize);
+    Ok(part.map(|p| (info, p.decoded().into_owned())))
+}
+
+/// Turn an attacker-controlled filename into a safe file name: no directories, no control
+/// characters, no leading dots, bounded length with the extension kept.
+pub fn sanitize_filename(name: Option<&str>, fallback_index: i64) -> String {
+    let base = name.unwrap_or("").rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').trim().to_string();
+    if cleaned.is_empty() {
+        return format!("attachment-{fallback_index}");
+    }
+    const MAX: usize = 120;
+    if cleaned.chars().count() <= MAX {
+        return cleaned;
+    }
+    let (stem, ext) = match cleaned.rfind('.') {
+        Some(i) if cleaned.len() - i <= 12 => (&cleaned[..i], &cleaned[i..]),
+        _ => (cleaned.as_str(), ""),
+    };
+    let keep = MAX.saturating_sub(ext.chars().count());
+    format!("{}{}", stem.chars().take(keep).collect::<String>(), ext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +138,28 @@ Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8gUERG\r\n--B--\r\n";
         assert_eq!(b.attachments[0].size, "Hello PDF".len() as i64, "size is the decoded length");
         assert!(!b.attachments[0].inline);
         assert_eq!(b.preview().unwrap(), "Hello team, the quarterly numbers are attached.");
+    }
+
+    #[test]
+    fn extracts_decoded_attachment_bytes_by_index() {
+        let (info, bytes) = extract_attachment(MULTIPART.as_bytes(), 0).unwrap().unwrap();
+        assert_eq!(info.filename.as_deref(), Some("q3.pdf"));
+        assert_eq!(bytes, b"Hello PDF");
+        assert!(extract_attachment(MULTIPART.as_bytes(), 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn filenames_cannot_escape_the_target_directory() {
+        assert_eq!(sanitize_filename(Some("../../etc/passwd"), 0), "passwd");
+        assert_eq!(sanitize_filename(Some("..\\..\\evil.exe"), 0), "evil.exe");
+        assert_eq!(sanitize_filename(Some(".bashrc"), 0), "bashrc");
+        assert_eq!(sanitize_filename(Some("a\nb\0c.txt"), 0), "abc.txt");
+        assert_eq!(sanitize_filename(Some("re:port?.pdf"), 0), "re_port_.pdf");
+        assert_eq!(sanitize_filename(Some("   "), 3), "attachment-3");
+        assert_eq!(sanitize_filename(None, 7), "attachment-7");
+        let long = format!("{}.pdf", "x".repeat(300));
+        let out = sanitize_filename(Some(&long), 0);
+        assert!(out.chars().count() <= 120 && out.ends_with(".pdf"), "{out}");
     }
 
     #[test]

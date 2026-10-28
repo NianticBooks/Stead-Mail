@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, AuthKind, Provider, ServerConfig};
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE accounts (
@@ -128,6 +128,27 @@ UPDATE messages
  WHERE thread_id IS NULL;
 "#;
 
+const MIGRATION_V5: &str = r#"
+CREATE TABLE outbox (
+    id              TEXT PRIMARY KEY,
+    account_id      TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    message_id      TEXT NOT NULL,
+    from_addr       TEXT NOT NULL,
+    rcpts           TEXT NOT NULL,
+    subject         TEXT NOT NULL,
+    raw             BLOB NOT NULL,
+    size            INTEGER NOT NULL,
+    state           TEXT NOT NULL CHECK (state IN ('queued','sending','sent','failed','cancelled')),
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    locked_at       INTEGER,
+    last_error      TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    sent_at         TEXT
+);
+CREATE INDEX outbox_due ON outbox(state, next_attempt_at);
+"#;
+
 /// An OAuth2 login (e.g. a Google account authorised for Calendar). The refresh token lives in
 /// the secret store under [`OAuthIdentity::refresh_secret_key`], never in SQLite.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,6 +259,56 @@ pub struct MailboxStateUpdate {
     pub exists: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutboxItem {
+    pub id: String,
+    pub account_id: String,
+    pub message_id: String,
+    pub from: String,
+    pub rcpts: Vec<String>,
+    pub subject: String,
+    pub size: i64,
+    /// queued | sending | sent | failed | cancelled
+    pub state: String,
+    pub attempts: i64,
+    /// Unix seconds; a queued item is due when this is in the past.
+    pub next_attempt_at: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub sent_at: Option<String>,
+}
+
+pub struct NewOutbox<'a> {
+    pub account_id: &'a str,
+    pub message_id: &'a str,
+    pub from: &'a str,
+    pub rcpts: &'a [String],
+    pub subject: &'a str,
+    pub raw: &'a [u8],
+    pub now: i64,
+}
+
+const OUTBOX_COLS: &str = "id, account_id, message_id, from_addr, rcpts, subject, size, state, attempts, next_attempt_at, last_error, created_at, sent_at";
+
+fn row_to_outbox(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxItem> {
+    let rcpts: String = r.get(4)?;
+    Ok(OutboxItem {
+        id: r.get(0)?,
+        account_id: r.get(1)?,
+        message_id: r.get(2)?,
+        from: r.get(3)?,
+        rcpts: serde_json::from_str(&rcpts).unwrap_or_default(),
+        subject: r.get(5)?,
+        size: r.get(6)?,
+        state: r.get(7)?,
+        attempts: r.get(8)?,
+        next_attempt_at: r.get(9)?,
+        last_error: r.get(10)?,
+        created_at: r.get(11)?,
+        sent_at: r.get(12)?,
+    })
+}
+
 fn msg_cols(prefix: &str) -> String {
     [
         "id", "mailbox_id", "uid", "message_id", "in_reply_to", "references_hdr", "subject", "from_name", "from_addr",
@@ -335,6 +406,9 @@ impl Store {
         }
         if version < 4 {
             tx.execute_batch(MIGRATION_V4)?;
+        }
+        if version < 5 {
+            tx.execute_batch(MIGRATION_V5)?;
         }
         if version < SCHEMA_VERSION {
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -638,6 +712,97 @@ impl Store {
     }
 
     /// Every cached message in a thread, oldest first.
+    // ----- outbox -----
+
+    pub fn outbox_insert(&self, n: &NewOutbox<'_>) -> Result<OutboxItem> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO outbox (id, account_id, message_id, from_addr, rcpts, subject, raw, size, state, next_attempt_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9)",
+            params![
+                id, n.account_id, n.message_id, n.from,
+                serde_json::to_string(n.rcpts).map_err(|e| Error::Other(e.to_string()))?,
+                n.subject, n.raw, n.raw.len() as i64, n.now,
+            ],
+        )?;
+        self.outbox_get(&id)
+    }
+
+    /// Look up by full id or by an unambiguous id prefix (what the CLI prints).
+    pub fn outbox_get(&self, id: &str) -> Result<OutboxItem> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {OUTBOX_COLS} FROM outbox WHERE id = ?1 OR id LIKE ?2 || '%' LIMIT 2"))?;
+        let mut rows: Vec<OutboxItem> = stmt.query_map(params![id, id], row_to_outbox)?.collect::<std::result::Result<_, _>>()?;
+        match rows.len() {
+            1 => Ok(rows.remove(0)),
+            0 => Err(Error::Invalid(format!("no outbox item '{id}'"))),
+            _ => Err(Error::Invalid(format!("outbox id prefix '{id}' is ambiguous"))),
+        }
+    }
+
+    pub fn outbox_raw(&self, id: &str) -> Result<Vec<u8>> {
+        Ok(self.conn.query_row("SELECT raw FROM outbox WHERE id = ?1", [id], |r| r.get(0))?)
+    }
+
+    pub fn outbox_due(&self, now: i64, account_id: Option<&str>) -> Result<Vec<OutboxItem>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {OUTBOX_COLS} FROM outbox WHERE state = 'queued' AND next_attempt_at <= ?1 AND (?2 IS NULL OR account_id = ?2)
+             ORDER BY next_attempt_at, created_at"
+        ))?;
+        Ok(stmt.query_map(params![now, account_id], row_to_outbox)?.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn outbox_list(&self, account_id: Option<&str>, include_done: bool, limit: usize) -> Result<Vec<OutboxItem>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {OUTBOX_COLS} FROM outbox WHERE (?1 IS NULL OR account_id = ?1) AND (?2 OR state IN ('queued','sending','failed'))
+             ORDER BY created_at DESC LIMIT ?3"
+        ))?;
+        Ok(stmt.query_map(params![account_id, include_done, limit as i64], row_to_outbox)?.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Claim an item for sending. Returns false if someone else already did.
+    pub fn outbox_lock(&self, id: &str, now: i64) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE outbox SET state='sending', locked_at=?2 WHERE id=?1 AND state='queued'", params![id, now])? == 1)
+    }
+
+    /// The bytes are no longer needed once the server has accepted the message.
+    pub fn outbox_mark_sent(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbox SET state='sent', attempts=attempts+1, raw=x'', locked_at=NULL, last_error=NULL,
+                    sent_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn outbox_mark_retry(&self, id: &str, next_attempt_at: i64, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbox SET state='queued', attempts=attempts+1, next_attempt_at=?2, locked_at=NULL, last_error=?3 WHERE id=?1",
+            params![id, next_attempt_at, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn outbox_mark_failed(&self, id: &str, error: &str) -> Result<()> {
+        self.conn.execute("UPDATE outbox SET state='failed', attempts=attempts+1, locked_at=NULL, last_error=?2 WHERE id=?1", params![id, error])?;
+        Ok(())
+    }
+
+    /// Put a failed item back in the queue, due now, with a fresh attempt budget.
+    pub fn outbox_requeue(&self, id: &str, now: i64) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE outbox SET state='queued', attempts=0, next_attempt_at=?2, last_error=NULL WHERE id=?1 AND state='failed'", params![id, now])? == 1)
+    }
+
+    pub fn outbox_cancel(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE outbox SET state='cancelled', raw=x'', locked_at=NULL WHERE id=?1 AND state IN ('queued','failed')", [id])? == 1)
+    }
+
+    /// Items stuck in `sending` because a process died mid-send go back to the queue. The window is
+    /// deliberately long: a crash after the server accepted the message can cause one duplicate,
+    /// but a short window would double-send while a slow connection is still working.
+    pub fn outbox_recover_stuck(&self, now: i64, stale_secs: i64) -> Result<usize> {
+        Ok(self.conn.execute("UPDATE outbox SET state='queued', locked_at=NULL WHERE state='sending' AND locked_at < ?1", [now - stale_secs])?)
+    }
+
     pub fn thread_messages(&self, account_id: &str, thread_id: &str) -> Result<Vec<MessageRow>> {
         let sql = format!(
             "SELECT {} FROM messages WHERE account_id = ?1 AND thread_id = ?2 ORDER BY COALESCE(date, internal_date), uid",
@@ -883,6 +1048,58 @@ mod tests {
         assert_eq!(s.thread_messages("a", "<p>").unwrap().len(), 3);
         // The pre-existing rows were indexed by the migration's FTS rebuild.
         assert_eq!(s.search("plan", None, 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn outbox_state_machine_and_locking() {
+        let (s, acct, _) = setup();
+        let rcpts = vec!["a@x.com".to_string(), "b@x.com".to_string()];
+        let new = |now| NewOutbox { account_id: &acct, message_id: "<m@x>", from: "f@x.com", rcpts: &rcpts, subject: "hi", raw: b"RAW", now };
+        let it = s.outbox_insert(&new(100)).unwrap();
+        assert_eq!((it.state.as_str(), it.attempts, it.rcpts.len(), it.size), ("queued", 0, 2, 3));
+        assert_eq!(s.outbox_get(&it.id[..8]).unwrap().id, it.id, "unambiguous prefix works");
+        assert!(s.outbox_due(99, None).unwrap().is_empty(), "not due before next_attempt_at");
+        assert_eq!(s.outbox_due(100, Some(&acct)).unwrap().len(), 1);
+        assert!(s.outbox_due(100, Some("other")).unwrap().is_empty());
+
+        assert!(s.outbox_lock(&it.id, 100).unwrap());
+        assert!(!s.outbox_lock(&it.id, 100).unwrap(), "a second claimant loses");
+        assert!(s.outbox_due(1000, None).unwrap().is_empty(), "a locked item is not due");
+
+        // Temporary failure schedules a retry and keeps the bytes.
+        s.outbox_mark_retry(&it.id, 160, "451 try later").unwrap();
+        let r = s.outbox_get(&it.id).unwrap();
+        assert_eq!((r.state.as_str(), r.attempts, r.next_attempt_at, r.last_error.as_deref()), ("queued", 1, 160, Some("451 try later")));
+        assert_eq!(s.outbox_raw(&it.id).unwrap(), b"RAW");
+
+        // Permanent failure keeps the bytes for a manual retry; requeue resets the budget.
+        s.outbox_lock(&it.id, 160).unwrap();
+        s.outbox_mark_failed(&it.id, "550 no such user").unwrap();
+        assert_eq!(s.outbox_get(&it.id).unwrap().state, "failed");
+        assert!(s.outbox_requeue(&it.id, 500).unwrap());
+        let r = s.outbox_get(&it.id).unwrap();
+        assert_eq!((r.state.as_str(), r.attempts, r.next_attempt_at), ("queued", 0, 500));
+        assert!(!s.outbox_requeue(&it.id, 500).unwrap(), "only failed items can be requeued");
+
+        // Success drops the bytes but keeps the record.
+        s.outbox_lock(&it.id, 500).unwrap();
+        s.outbox_mark_sent(&it.id).unwrap();
+        let r = s.outbox_get(&it.id).unwrap();
+        assert_eq!((r.state.as_str(), r.attempts), ("sent", 1));
+        assert!(r.sent_at.is_some() && r.last_error.is_none());
+        assert!(s.outbox_raw(&it.id).unwrap().is_empty());
+        assert!(!s.outbox_cancel(&it.id).unwrap(), "a sent item cannot be cancelled");
+        assert!(s.outbox_list(None, false, 10).unwrap().is_empty(), "done items are hidden by default");
+        assert_eq!(s.outbox_list(None, true, 10).unwrap().len(), 1);
+
+        // Crash recovery only touches stale locks.
+        let b = s.outbox_insert(&new(1000)).unwrap();
+        s.outbox_lock(&b.id, 1000).unwrap();
+        assert_eq!(s.outbox_recover_stuck(1100, 300).unwrap(), 0, "fresh lock is left alone");
+        assert_eq!(s.outbox_recover_stuck(1400, 300).unwrap(), 1);
+        assert_eq!(s.outbox_get(&b.id).unwrap().state, "queued");
+        assert!(s.outbox_cancel(&b.id).unwrap());
+        assert!(s.outbox_raw(&b.id).unwrap().is_empty());
     }
 
     #[test]

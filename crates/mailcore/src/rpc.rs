@@ -59,6 +59,30 @@ struct MessageParams {
 }
 
 #[derive(Deserialize)]
+struct OutboxListParams {
+    account: Option<String>,
+    #[serde(default)]
+    all: bool,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+#[derive(Deserialize)]
+struct OutboxIdParams {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct AttachmentParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    uid: u32,
+    index: i64,
+    dir: String,
+}
+
+#[derive(Deserialize)]
 struct SearchParams {
     query: String,
     account: Option<String>,
@@ -126,6 +150,27 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
                 let opts = crate::sync::SyncOptions { initial_limit: p.limit, backfill: p.backfill };
                 to_json(&api.sync_mailbox_opts(&p.account, &p.mailbox, opts).await?)
             }
+            "sync.all" => {
+                let p: SyncParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.sync_all(&p.account, crate::sync::SyncOptions { initial_limit: p.limit, backfill: p.backfill }).await?)
+            }
+            "outbox.list" => {
+                let p: OutboxListParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.outbox_list(p.account.as_deref(), p.all, p.limit as usize)?)
+            }
+            "outbox.flush" => to_json(&api.outbox_flush().await?),
+            "outbox.retry" => {
+                let p: OutboxIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.outbox_retry(&p.id)?)
+            }
+            "outbox.cancel" => {
+                let p: OutboxIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.outbox_cancel(&p.id)?)
+            }
+            "attachment.save" => {
+                let p: AttachmentParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.save_attachment(&p.account, &p.mailbox, p.uid, p.index, std::path::Path::new(&p.dir)).await?)
+            }
             "message.get" => {
                 let p: MessageParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.fetch_message(&p.account, &p.mailbox, p.uid).await?)
@@ -140,7 +185,7 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
             }
             "send" => {
                 let p: SendRequest = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
-                to_json(&api.send_text(p).await?)
+                to_json(&api.send(p).await?)
             }
             "caldav.calendars" => {
                 let p: AccountParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;

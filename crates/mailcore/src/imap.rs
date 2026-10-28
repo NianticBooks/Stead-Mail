@@ -276,6 +276,8 @@ pub(crate) mod fake_server {
         pub msgs: Vec<FakeMsg>,
         /// When set, IDLE pushes `* N EXISTS` shortly after it starts.
         pub push_on_idle: bool,
+        /// Extra raw `* LIST ...` lines (without CRLF) to advertise besides INBOX and Sent Messages.
+        pub extra_list: Vec<String>,
         /// Every command line received, for assertions about what the client asked for.
         pub log: Vec<String>,
     }
@@ -290,6 +292,7 @@ pub(crate) mod fake_server {
                     FakeMsg { uid: 1002, flags: String::new(), raw: format!("{HEADERS_2}Your dentist appointment is Thursday.\r\n"), internal_date: "27-Oct-2026 08:00:01 +0000".into() },
                 ],
                 push_on_idle: false,
+                extra_list: Vec::new(),
                 log: Vec::new(),
             }
         }
@@ -384,9 +387,12 @@ pub(crate) mod fake_server {
                                 }
                             }
                             "CAPABILITY" => format!("* CAPABILITY IMAP4rev1 IDLE\r\n{tag} OK CAPABILITY completed\r\n"),
-                            "LIST" => format!(
-                                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent Messages\"\r\n{tag} OK LIST completed\r\n"
-                            ),
+                            "LIST" => {
+                                let extra: String = state.lock().unwrap().extra_list.iter().map(|l| format!("{l}\r\n")).collect();
+                                format!(
+                                    "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent Messages\"\r\n{extra}{tag} OK LIST completed\r\n"
+                                )
+                            }
                             "SELECT" | "EXAMINE" => {
                                 let st = state.lock().unwrap();
                                 format!(

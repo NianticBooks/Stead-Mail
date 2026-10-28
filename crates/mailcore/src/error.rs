@@ -10,8 +10,12 @@ pub enum Error {
     Imap(#[from] async_imap::error::Error),
     #[error("tls error: {0}")]
     Tls(String),
+    /// The server rejected the request or credentials. Retrying the same thing will not help.
     #[error("smtp error: {0}")]
     Smtp(String),
+    /// Network trouble or a 4xx reply. Worth retrying later.
+    #[error("smtp error (temporary): {0}")]
+    SmtpTransient(String),
     #[error("http error: {0}")]
     Http(String),
     #[error("oauth error: {0}")]

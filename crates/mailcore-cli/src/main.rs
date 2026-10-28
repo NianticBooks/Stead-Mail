@@ -37,6 +37,9 @@ enum Cmd {
         /// Also pull this many older messages below the oldest cached one.
         #[arg(long, default_value_t = 0)]
         backfill: u32,
+        /// Sync every worthwhile folder (skips Trash, Junk, All Mail and unselectable containers).
+        #[arg(long, conflicts_with = "mailbox")]
+        all: bool,
     },
     /// Download and show one message (the body is cached locally after the first time).
     Show {
@@ -80,11 +83,16 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Send a plain-text message through an account's SMTP server.
+    /// Queue a message and send it now. If the server is unreachable it stays queued and is retried.
     Send {
         account: String,
         #[arg(long, required = true)]
         to: Vec<String>,
+        #[arg(long)]
+        cc: Vec<String>,
+        /// Blind copy: delivered but never written into the message.
+        #[arg(long)]
+        bcc: Vec<String>,
         #[arg(long)]
         subject: String,
         /// Message body. Use --body-stdin to read it from stdin instead.
@@ -92,6 +100,34 @@ enum Cmd {
         body: String,
         #[arg(long)]
         body_stdin: bool,
+        /// Attach a file (repeatable). The file is read now, not when the message is delivered.
+        #[arg(long)]
+        attach: Vec<String>,
+        /// Message-ID being answered (with or without angle brackets).
+        #[arg(long)]
+        in_reply_to: Option<String>,
+        /// References chain of the original message, oldest first (repeatable).
+        #[arg(long)]
+        references: Vec<String>,
+        /// Only queue the message; do not attempt delivery.
+        #[arg(long)]
+        queue_only: bool,
+    },
+    /// Inspect and run the outgoing queue.
+    Outbox {
+        #[command(subcommand)]
+        cmd: OutboxCmd,
+    },
+    /// Save one attachment of a message (index as printed by `show`) without overwriting anything.
+    Attachment {
+        account: String,
+        uid: u32,
+        index: i64,
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        /// Directory to save into.
+        #[arg(long, default_value = ".")]
+        dir: std::path::PathBuf,
     },
     /// List the CalDAV calendars of an account (iCloud reuses the app-specific password).
     Caldav { account: String },
@@ -109,6 +145,28 @@ enum Cmd {
         #[arg(long, conflicts_with = "socket")]
         socket_path: Option<std::path::PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum OutboxCmd {
+    /// Show queued, sending and failed messages (add --all for sent and cancelled too).
+    List {
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Attempt every message that is due, once.
+    Flush,
+    /// Keep flushing every N seconds until interrupted.
+    Run {
+        #[arg(long, default_value_t = 30)]
+        every: u64,
+    },
+    /// Put a failed message back in the queue.
+    Retry { id: String },
+    /// Give up on a queued or failed message.
+    Cancel { id: String },
 }
 
 #[derive(Subcommand)]
@@ -232,9 +290,23 @@ async fn main() -> Result<()> {
                 println!("{:<40} exists={:<6} uidvalidity={:<12} synced={}", m.name, fmt_opt(m.exists_count), fmt_opt(m.uidvalidity), m.last_synced_at.clone().unwrap_or_else(|| "never".into()));
             }
         }),
-        Cmd::Sync { account, mailbox, limit, backfill } => {
+        Cmd::Sync { account, mailbox, limit, backfill, all } => {
             let opts = mailcore::sync::SyncOptions { initial_limit: limit, backfill };
-            out(cli.json, &api.sync_mailbox_opts(&account, &mailbox, opts).await?, |r| println!("{}", fmt_sync(r)))
+            if all {
+                out(cli.json, &api.sync_all(&account, opts).await?, |r| {
+                    for x in &r.reports {
+                        println!("{}", fmt_sync(x));
+                    }
+                    if !r.skipped.is_empty() {
+                        println!("skipped: {}", r.skipped.join(", "));
+                    }
+                    for (m, e) in &r.errors {
+                        println!("FAILED {m}: {e}");
+                    }
+                })
+            } else {
+                out(cli.json, &api.sync_mailbox_opts(&account, &mailbox, opts).await?, |r| println!("{}", fmt_sync(r)))
+            }
         }
         Cmd::Show { account, uid, mailbox, html } => out(cli.json, &api.fetch_message(&account, &mailbox, uid).await?, |d| {
             let h = &d.row.header;
@@ -244,7 +316,7 @@ async fn main() -> Result<()> {
             println!("Subject: {}", h.subject.clone().unwrap_or_default());
             println!("Flags:   {}   Thread: {}", if h.flags.is_empty() { "(unread)" } else { &h.flags }, d.row.thread_id.clone().unwrap_or_default());
             for a in &d.attachments {
-                println!("Attach:  {} ({}, {} bytes){}", a.filename.clone().unwrap_or_else(|| "(unnamed)".into()), a.content_type, a.size, if a.inline { " inline" } else { "" });
+                println!("Attach:  [{}] {} ({}, {} bytes){}", a.part_index, a.filename.clone().unwrap_or_else(|| "(unnamed)".into()), a.content_type, a.size, if a.inline { " inline" } else { "" });
             }
             println!();
             let body = if html { d.body_html.clone() } else { d.body_text.clone() };
@@ -293,7 +365,7 @@ async fn main() -> Result<()> {
                 println!("{:>6}  {:<25.25}  {:<28.28}  {}", h.uid, date, from, h.subject.clone().unwrap_or_else(|| "(no subject)".into()));
             }
         }),
-        Cmd::Send { account, to, subject, body, body_stdin } => {
+        Cmd::Send { account, to, cc, bcc, subject, body, body_stdin, attach, in_reply_to, references, queue_only } => {
             let body = if body_stdin {
                 let mut b = String::new();
                 std::io::Read::read_to_string(&mut std::io::stdin(), &mut b)?;
@@ -301,9 +373,41 @@ async fn main() -> Result<()> {
             } else {
                 body
             };
-            let r = api.send_text(mailcore::api::SendRequest { account, to, subject, body }).await?;
-            out(cli.json, &r, |r| println!("sent from {} to {} via {}", r.from, r.to.join(", "), r.smtp_host))
+            let req = mailcore::api::SendRequest { account, to, cc, bcc, subject, body, in_reply_to, references, attachments: attach };
+            if queue_only {
+                out(cli.json, &api.outbox_enqueue(req)?, |i| println!("queued {} ({} bytes) to {}", short(&i.id), i.size, i.rcpts.join(", ")))
+            } else {
+                out(cli.json, &api.send(req).await?, |o| match o.item.state.as_str() {
+                    "sent" => println!("sent {} to {}", short(&o.item.id), o.item.rcpts.join(", ")),
+                    "queued" => println!("not delivered yet ({}); queued as {} and will retry", o.item.last_error.clone().unwrap_or_default(), short(&o.item.id)),
+                    _ => println!("FAILED {}: {}", short(&o.item.id), o.item.last_error.clone().unwrap_or_default()),
+                })
+            }
         }
+        Cmd::Outbox { cmd } => match cmd {
+            OutboxCmd::List { account, all } => out(cli.json, &api.outbox_list(account.as_deref(), all, 100)?, |l| {
+                if l.is_empty() {
+                    println!("outbox is empty");
+                }
+                for i in l {
+                    println!("{}  {:<9} tries {} {:<28.28} {}{}", short(&i.id), i.state, i.attempts, i.rcpts.join(","), i.subject, i.last_error.as_deref().map(|e| format!("\n          ! {e}")).unwrap_or_default());
+                }
+            }),
+            OutboxCmd::Flush => out(cli.json, &api.outbox_flush().await?, |r| println!("attempted {}: sent {}, will retry {}, failed {}", r.attempted, r.sent, r.retrying, r.failed)),
+            OutboxCmd::Run { every } => {
+                eprintln!("flushing the outbox every {every}s (Ctrl-C to stop)");
+                loop {
+                    let r = api.outbox_flush().await?;
+                    if r.attempted > 0 {
+                        println!("{}  attempted {}: sent {}, will retry {}, failed {}", chrono::Local::now().format("%H:%M:%S"), r.attempted, r.sent, r.retrying, r.failed);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(every)).await;
+                }
+            }
+            OutboxCmd::Retry { id } => out(cli.json, &api.outbox_retry(&id)?, |i| println!("requeued {}", short(&i.id))),
+            OutboxCmd::Cancel { id } => out(cli.json, &api.outbox_cancel(&id)?, |i| println!("cancelled {}", short(&i.id))),
+        },
+        Cmd::Attachment { account, uid, index, mailbox, dir } => out(cli.json, &api.save_attachment(&account, &mailbox, uid, index, &dir).await?, |a| println!("saved {} ({} bytes, {}) to {}", a.filename, a.bytes, a.content_type, a.path)),
         Cmd::Caldav { account } => out(cli.json, &api.caldav_calendars(&account).await?, |r| {
             println!("CalDAV home: {}", r.home.home);
             for c in &r.calendars {
@@ -361,12 +465,29 @@ async fn main() -> Result<()> {
                 None => mailcore::rpc::serve_stdio(&api).await?,
                 Some(p) => {
                     eprintln!("mailcore daemon listening on {}", p.display());
-                    mailcore::rpc::serve_unix(std::sync::Arc::new(api), &p).await?
+                    let api = std::sync::Arc::new(api);
+                    // The daemon is long-lived, so it is the natural owner of outbox retries.
+                    let flusher = api.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match flusher.outbox_flush().await {
+                                Ok(r) if r.attempted > 0 => tracing::info!("outbox: sent {}, retrying {}, failed {}", r.sent, r.retrying, r.failed),
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!("outbox flush failed: {e}"),
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        }
+                    });
+                    mailcore::rpc::serve_unix(api, &p).await?
                 }
             }
         }
     }
     Ok(())
+}
+
+fn short(id: &str) -> &str {
+    &id[..id.len().min(8)]
 }
 
 fn fmt_sync(r: &mailcore::api::SyncReport) -> String {
