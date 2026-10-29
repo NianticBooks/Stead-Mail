@@ -15,6 +15,9 @@ pub struct Calendar {
     pub kind: String,
     pub read_only: bool,
     pub visible: bool,
+    /// When a synced calendar last synced successfully, and why the latest attempt failed, if it did.
+    pub last_sync_at: Option<String>,
+    pub last_sync_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

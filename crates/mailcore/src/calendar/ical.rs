@@ -7,7 +7,7 @@ use serde::Serialize;
 use super::model::{Event, parse_instant, rfc3339};
 use crate::ai::ics;
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -52,14 +52,78 @@ fn date_stamp(t: DateTime<Utc>, tz: Tz) -> String {
 }
 
 pub fn export(name: &str, events: &[Event]) -> String {
+    let items: Vec<(&Event, Option<&Extra>)> = events.iter().map(|e| (e, None)).collect();
+    write_calendar(Some(name), &items)
+}
+
+/// One event as the body of a CalDAV resource. `extra` re-attaches what the server had that we
+/// do not model, so an edit made here does not delete alarms or changed occurrences there.
+pub fn export_resource(ev: &Event, extra: Option<&Extra>) -> String {
+    write_calendar(None, &[(ev, extra)])
+}
+
+/// Parts of a remote event we keep verbatim: alarms inside the event, and whole VEVENTs that
+/// override single occurrences of a series.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Extra {
+    pub alarms: Vec<String>,
+    pub overrides: Vec<String>,
+}
+
+impl Extra {
+    pub fn is_empty(&self) -> bool {
+        self.alarms.is_empty() && self.overrides.is_empty()
+    }
+}
+
+/// Pull the alarms and the override VEVENTs for `uid` out of a CalDAV resource.
+pub fn extract_extra(text: &str, uid: &str) -> Extra {
+    let lines = ics::unfold(text);
+    let mut extra = Extra::default();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim().eq_ignore_ascii_case("BEGIN:VEVENT") {
+            let start = i;
+            while i < lines.len() && !lines[i].trim().eq_ignore_ascii_case("END:VEVENT") {
+                i += 1;
+            }
+            let block = &lines[start..i.min(lines.len() - 1) + 1];
+            let is_override = block.iter().any(|l| l.to_ascii_uppercase().starts_with("RECURRENCE-ID"));
+            let same_uid = block.iter().any(|l| l.strip_prefix("UID:").is_some_and(|v| v.trim() == uid));
+            if same_uid {
+                if is_override {
+                    extra.overrides.push(block.join("\r\n"));
+                } else {
+                    let mut j = 0;
+                    while j < block.len() {
+                        if block[j].trim().eq_ignore_ascii_case("BEGIN:VALARM") {
+                            let a = j;
+                            while j < block.len() && !block[j].trim().eq_ignore_ascii_case("END:VALARM") {
+                                j += 1;
+                            }
+                            extra.alarms.push(block[a..j.min(block.len() - 1) + 1].join("\r\n"));
+                        }
+                        j += 1;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    extra
+}
+
+fn write_calendar(name: Option<&str>, events: &[(&Event, Option<&Extra>)]) -> String {
     let mut out = String::new();
     let mut push = |l: String| out.push_str(&fold(&l));
     push("BEGIN:VCALENDAR".into());
     push("VERSION:2.0".into());
     push("PRODID:-//mailcore//AI mail client//EN".into());
     push("CALSCALE:GREGORIAN".into());
-    push(format!("X-WR-CALNAME:{}", esc(name)));
-    for ev in events {
+    if let Some(name) = name {
+        push(format!("X-WR-CALNAME:{}", esc(name)));
+    }
+    for (ev, extra) in events {
         let (Ok(start), Ok(end)) = (parse_instant(&ev.start_utc), parse_instant(&ev.end_utc)) else { continue };
         let tz: Tz = ev.tz.as_deref().and_then(|t| t.parse().ok()).unwrap_or(chrono_tz::UTC);
         push("BEGIN:VEVENT".into());
@@ -103,7 +167,17 @@ pub fn export(name: &str, events: &[Event]) -> String {
         for a in &ev.attendees {
             push(format!("ATTENDEE:mailto:{a}"));
         }
+        if let Some(x) = extra {
+            for a in &x.alarms {
+                a.split("\r\n").for_each(|l| push(l.to_string()));
+            }
+        }
         push("END:VEVENT".into());
+        if let Some(x) = extra {
+            for o in &x.overrides {
+                o.split("\r\n").for_each(|l| push(l.to_string()));
+            }
+        }
     }
     push("END:VCALENDAR".into());
     out
@@ -121,6 +195,7 @@ pub const MAX_IMPORT_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_IMPORT_EVENTS: usize = 5000;
 
 /// An event parsed from a file, before it is placed in a calendar.
+#[derive(Debug, Clone)]
 pub struct Imported {
     pub uid: Option<String>,
     pub title: String,
@@ -139,54 +214,55 @@ pub struct Imported {
 }
 
 pub fn parse_import(text: &str, default_tz: Tz, skipped: &mut Vec<String>) -> Vec<Imported> {
-    let mut out = Vec::new();
-    for e in ics::parse(text).into_iter().take(MAX_IMPORT_EVENTS) {
-        let name = if e.summary.trim().is_empty() { "(untitled)".to_string() } else { e.summary.clone() };
-        if e.recurrence_id.is_some() {
-            skipped.push(format!("{name}: a changed single occurrence of a series is not supported yet"));
-            continue;
-        }
-        let Some(r) = e.resolve(default_tz) else {
-            skipped.push(format!("{name}: no usable start time"));
-            continue;
-        };
-        let end = r.end_utc.unwrap_or(r.start_utc + chrono::Duration::hours(1));
-        let tz_name = r.tz.clone().unwrap_or_else(|| default_tz.name().to_string());
-        let tz: Tz = tz_name.parse().unwrap_or(default_tz);
-        let rrule = match e.rrule.as_deref() {
-            Some(rule) => match super::recur::normalize_rule(rule, r.start_utc, tz) {
-                Ok(rule) => Some(rule),
-                Err(err) => {
-                    skipped.push(format!("{name}: {err}"));
-                    continue;
-                }
-            },
-            None => None,
-        };
-        let exdates = e.exdates.iter().filter_map(|x| x.resolve(default_tz)).map(|(t, _, _)| rfc3339(t)).collect();
-        let status = match e.status.as_deref() {
-            Some("TENTATIVE") => "tentative",
-            Some("CANCELLED") => "cancelled",
-            _ => "confirmed",
-        };
-        out.push(Imported {
-            uid: e.uid.clone().filter(|u| !u.trim().is_empty()),
-            title: name,
-            description: e.description.clone(),
-            location: e.location.clone(),
-            start: r.start_utc,
-            end,
-            all_day: r.all_day,
-            tz: Some(tz_name),
-            rrule,
-            exdates,
-            status: status.into(),
-            organizer: e.organizer.clone(),
-            attendees: e.attendees.clone(),
-            sequence: e.sequence.unwrap_or(0),
-        });
+    ics::parse(text).iter().take(MAX_IMPORT_EVENTS).filter_map(|e| import_one(e, default_tz, skipped)).collect()
+}
+
+/// Turn one parsed VEVENT into something storable, or say why not.
+pub fn import_one(e: &ics::IcsEvent, default_tz: Tz, skipped: &mut Vec<String>) -> Option<Imported> {
+    let name = if e.summary.trim().is_empty() { "(untitled)".to_string() } else { e.summary.clone() };
+    if e.recurrence_id.is_some() {
+        skipped.push(format!("{name}: a changed single occurrence of a series is not supported yet"));
+        return None;
     }
-    out
+    let Some(r) = e.resolve(default_tz) else {
+        skipped.push(format!("{name}: no usable start time"));
+        return None;
+    };
+    let end = r.end_utc.unwrap_or(r.start_utc + chrono::Duration::hours(1));
+    let tz_name = r.tz.clone().unwrap_or_else(|| default_tz.name().to_string());
+    let tz: Tz = tz_name.parse().unwrap_or(default_tz);
+    let rrule = match e.rrule.as_deref() {
+        Some(rule) => match super::recur::normalize_rule(rule, r.start_utc, tz) {
+            Ok(rule) => Some(rule),
+            Err(err) => {
+                skipped.push(format!("{name}: {err}"));
+                return None;
+            }
+        },
+        None => None,
+    };
+    let exdates = e.exdates.iter().filter_map(|x| x.resolve(default_tz)).map(|(t, _, _)| rfc3339(t)).collect();
+    let status = match e.status.as_deref() {
+        Some("TENTATIVE") => "tentative",
+        Some("CANCELLED") => "cancelled",
+        _ => "confirmed",
+    };
+    Some(Imported {
+        uid: e.uid.clone().filter(|u| !u.trim().is_empty()),
+        title: name,
+        description: e.description.clone(),
+        location: e.location.clone(),
+        start: r.start_utc,
+        end,
+        all_day: r.all_day,
+        tz: Some(tz_name),
+        rrule,
+        exdates,
+        status: status.into(),
+        organizer: e.organizer.clone(),
+        attendees: e.attendees.clone(),
+        sequence: e.sequence.unwrap_or(0),
+    })
 }
 
 #[cfg(test)]

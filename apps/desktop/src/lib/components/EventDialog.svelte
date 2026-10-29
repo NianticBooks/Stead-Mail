@@ -238,7 +238,7 @@
       <label class="field">Guests <input class="input" bind:value={f.attendees} placeholder="name@example.com, …" autocomplete="off" /></label>
       <div class="row">
         <label class="field grow">Calendar
-          <select class="input" bind:value={f.calendarId}>
+          <select class="input" bind:value={f.calendarId} disabled={editing && cal.calendars.some((c) => c.kind !== "local")} title={editing && cal.calendars.some((c) => c.kind !== "local") ? "An event stays in its calendar once it exists" : ""}>
             {#each cal.writable as c (c.id)}<option value={c.id}>{c.name}</option>{/each}
           </select>
         </label>

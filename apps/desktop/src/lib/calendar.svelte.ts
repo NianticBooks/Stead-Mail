@@ -2,7 +2,10 @@ import { api, shell } from "./api";
 import { app } from "./state.svelte";
 import { open as pickFiles } from "@tauri-apps/plugin-dialog";
 import { addDays, browserTz, rangeFor, shift, startOfDay, type CalView, type WeekStart } from "./cal";
-import type { CalEvent, Calendar, EventInput, Occurrence } from "./types";
+import type { CalEvent, CalSyncReport, Calendar, EventInput, Occurrence, RemoteList, SyncLogEntry } from "./types";
+
+/** How often linked calendars sync while the app is open. */
+const AUTO_SYNC_MS = 5 * 60 * 1000;
 
 const PREFS_KEY = "mailcore.calendar";
 
@@ -50,12 +53,21 @@ class CalendarState {
   stale = true;
   #token = 0;
 
+  // Two-way sync with Google and iCloud
+  syncing = $state(false);
+  connectOpen = $state(false);
+  logOpen = $state(false);
+  remote = $state<RemoteList | null>(null);
+  remoteLoading = $state(false);
+  log = $state<SyncLogEntry[]>([]);
+  #timer: ReturnType<typeof setInterval> | null = null;
+
   get range() {
     return rangeFor(this.view, this.anchor, this.weekStart);
   }
 
   get overlayOpen() {
-    return this.dialog !== null || this.calendarDialog !== null;
+    return this.dialog !== null || this.calendarDialog !== null || this.connectOpen || this.logOpen;
   }
 
   #save() {
@@ -73,8 +85,12 @@ class CalendarState {
   }
 
   async open() {
-    if (this.calendars.length === 0) await this.loadCalendars();
+    const first = this.calendars.length === 0;
+    if (first) await this.loadCalendars();
     if (this.stale) await this.refresh();
+    this.startAutoSync();
+    // Entering the calendar for the first time this session catches up with the servers.
+    if (first && this.hasSynced) void this.sync(undefined, true);
   }
 
   async loadCalendars() {
@@ -215,6 +231,114 @@ class CalendarState {
       return null;
     } catch (e) {
       return errText(e);
+    }
+  }
+
+  // ---------------------------------------------------------------- sync
+
+  get hasSynced() {
+    return this.calendars.some((c) => c.kind !== "local");
+  }
+
+  /** Sync on a timer while the app is open. Safe to call more than once. */
+  startAutoSync() {
+    if (this.#timer) return;
+    this.#timer = setInterval(() => {
+      if (this.hasSynced && !this.syncing) void this.sync(undefined, true);
+    }, AUTO_SYNC_MS);
+  }
+
+  /** Pull, then push, one calendar or all of them. `quiet` skips the toast when nothing happened. */
+  async sync(calendar?: string, quiet = false) {
+    if (this.syncing) return;
+    this.syncing = true;
+    try {
+      const reports = await api.calendarSync(calendar);
+      await this.loadCalendars();
+      await this.refresh();
+      this.summarize(reports, quiet);
+    } catch (e) {
+      if (!quiet) app.toast("error", errText(e));
+    } finally {
+      this.syncing = false;
+    }
+  }
+
+  summarize(reports: CalSyncReport[], quiet: boolean) {
+    const sum = (f: (r: CalSyncReport) => number) => reports.reduce((n, r) => n + f(r), 0);
+    const conflicts = sum((r) => r.conflicts);
+    const errors = reports.flatMap((r) => r.errors.map((e) => `${r.calendar}: ${e}`));
+    const changed = sum((r) => r.pulled + r.removed + r.pushed);
+    if (conflicts > 0) {
+      app.toast("info", `Synced. ${conflicts} change${conflicts === 1 ? "" : "s"} conflicted; the server's version was kept.`, { label: "View log", run: () => void this.openLog() });
+    } else if (errors.length > 0) {
+      app.toast("error", errors[0] + (errors.length > 1 ? ` (+${errors.length - 1} more)` : ""), { label: "View log", run: () => void this.openLog() });
+    } else if (!quiet) {
+      app.toast("success", changed === 0 ? "Calendars are up to date" : `Synced: ${sum((r) => r.pulled + r.removed)} in, ${sum((r) => r.pushed)} out`);
+    }
+  }
+
+  async openConnect() {
+    this.connectOpen = true;
+    await this.loadRemote();
+  }
+
+  async loadRemote() {
+    this.remoteLoading = true;
+    try {
+      this.remote = await api.calendarRemote();
+    } catch (e) {
+      app.toast("error", errText(e));
+    } finally {
+      this.remoteLoading = false;
+    }
+  }
+
+  /** Mirror a server calendar here, then fill it. */
+  async link(source: string, accountId: string, remoteId: string): Promise<string | null> {
+    try {
+      const c = await api.calendarLink(source, accountId, remoteId);
+      await this.loadCalendars();
+      await this.loadRemote();
+      void this.sync(c.id);
+      return null;
+    } catch (e) {
+      return errText(e);
+    }
+  }
+
+  async unlinkCalendar(c: Calendar): Promise<string | null> {
+    try {
+      await api.calendarUnlink(c.id);
+      this.calendarDialog = null;
+      await this.loadCalendars();
+      await this.refresh();
+      app.toast("info", `Stopped syncing “${c.name}”. Nothing was deleted on the server.`);
+      return null;
+    } catch (e) {
+      return errText(e);
+    }
+  }
+
+  async openLog() {
+    this.logOpen = true;
+    await this.loadLog();
+  }
+
+  async loadLog() {
+    try {
+      this.log = await api.syncLog(200);
+    } catch (e) {
+      app.toast("error", errText(e));
+    }
+  }
+
+  async clearLog() {
+    try {
+      await api.syncLogClear();
+      this.log = [];
+    } catch (e) {
+      app.toast("error", errText(e));
     }
   }
 

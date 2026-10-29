@@ -20,6 +20,7 @@
     { keys: [["["], ["←"]], what: "Calendar: previous period" },
     { keys: [["]"], ["→"]], what: "Calendar: next period" },
     { keys: [["m"], ["w"], ["d"], ["a"]], what: "Calendar: month, week, day, agenda" },
+    { keys: [["s"]], what: "Calendar: sync with Google and iCloud now" },
     { keys: [["Esc"]], what: "Close dialog, clear search" },
     { keys: [["?"]], what: "This help" },
   ];

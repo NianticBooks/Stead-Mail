@@ -13,6 +13,8 @@
   import CalendarView from "$lib/components/CalendarView.svelte";
   import EventDialog from "$lib/components/EventDialog.svelte";
   import CalendarDialog from "$lib/components/CalendarDialog.svelte";
+  import ConnectDialog from "$lib/components/ConnectDialog.svelte";
+  import SyncLogDialog from "$lib/components/SyncLogDialog.svelte";
   import { cal } from "$lib/calendar.svelte";
 
   let list = $state<MessageList | null>(null);
@@ -67,6 +69,7 @@
         case "w": cal.setView("week"); break;
         case "d": cal.setView("day"); break;
         case "a": cal.setView("agenda"); break;
+        case "s": if (cal.hasSynced) { e.preventDefault(); void cal.sync(); } break;
         case "?": app.helpOpen = true; break;
         case "g":
           chord = "g";
@@ -136,6 +139,8 @@
 
 {#if cal.dialog}<EventDialog />{/if}
 {#if cal.calendarDialog}<CalendarDialog />{/if}
+{#if cal.connectOpen}<ConnectDialog />{/if}
+{#if cal.logOpen}<SyncLogDialog />{/if}
 
 <Compose />
 <Settings />

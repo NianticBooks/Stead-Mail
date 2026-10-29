@@ -25,11 +25,15 @@ pub struct Api {
     pub(crate) secrets: Box<dyn SecretStore>,
     pub(crate) data_dir: PathBuf,
     pub(crate) http: reqwest::Client,
-    google_endpoints: GoogleEndpoints,
+    pub(crate) google_endpoints: GoogleEndpoints,
     smtp_transport: smtp::Transport,
     /// One local-model call at a time, so batches never stack model loads on the GPU.
     pub(crate) llm_gate: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) anthropic_url: String,
+    /// Replaces the CalDAV server address (tests, self-hosted servers).
+    pub(crate) caldav_base: Option<String>,
+    /// One calendar sync at a time.
+    pub(crate) sync_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,7 +194,7 @@ pub struct SyncReport {
 impl Api {
     pub fn new(store: Store, secrets: Box<dyn SecretStore>, data_dir: PathBuf) -> Api {
         let http = crate::http_client();
-        Api { store: Mutex::new(store), secrets, data_dir, http, google_endpoints: GoogleEndpoints::default(), smtp_transport: smtp::Transport::Tls, llm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)), anthropic_url: crate::ai::llm::ANTHROPIC_URL.to_string() }
+        Api { store: Mutex::new(store), secrets, data_dir, http, google_endpoints: GoogleEndpoints::default(), smtp_transport: smtp::Transport::Tls, llm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)), anthropic_url: crate::ai::llm::ANTHROPIC_URL.to_string(), caldav_base: std::env::var("MAILCORE_CALDAV_URL").ok().filter(|u| !u.is_empty()), sync_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     /// Point the cloud model at a different host (tests).
@@ -206,6 +210,11 @@ impl Api {
     }
 
     /// Point Google calls at a different host (tests).
+    pub fn with_caldav_base(mut self, url: &str) -> Api {
+        self.caldav_base = Some(url.to_string());
+        self
+    }
+
     pub fn with_google_endpoints(mut self, ep: GoogleEndpoints) -> Api {
         self.google_endpoints = ep;
         self
@@ -461,16 +470,20 @@ impl Api {
 
     // ----- iCloud / generic CalDAV -----
 
+    pub(crate) fn caldav_client(&self, account: &Account, password: &str) -> Result<CalDavClient> {
+        let base = match (&self.caldav_base, account.provider) {
+            (Some(b), _) => b.clone(),
+            (None, Provider::Icloud) => caldav::ICLOUD_CALDAV.to_string(),
+            (None, _) => std::env::var("MAILCORE_CALDAV_URL").map_err(|_| Error::Invalid("set MAILCORE_CALDAV_URL for non-iCloud CalDAV accounts".into()))?,
+        };
+        CalDavClient::new(&base, &account.email, password)
+    }
+
     /// Discover the CalDAV home and list calendars. For iCloud the app-specific password is reused.
     pub async fn caldav_calendars(&self, key: &str) -> Result<CalDavReport> {
         let account = self.store().find_account(key)?;
         let password = self.password_for(&account)?;
-        let base = match account.provider {
-            Provider::Icloud => caldav::ICLOUD_CALDAV.to_string(),
-            _ => std::env::var("MAILCORE_CALDAV_URL")
-                .map_err(|_| Error::Invalid("set MAILCORE_CALDAV_URL for non-iCloud CalDAV accounts".into()))?,
-        };
-        let client = CalDavClient::new(&base, &account.email, &password)?;
+        let client = self.caldav_client(&account, &password)?;
         let home = client.discover().await?;
         let calendars = client.list_calendars(&home.home).await?;
         Ok(CalDavReport { account: account.name, home, calendars })

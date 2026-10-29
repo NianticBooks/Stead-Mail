@@ -71,7 +71,7 @@ fn parse_tz(name: &str) -> Option<Tz> {
 }
 
 /// Unfold continuation lines and split into logical lines.
-fn unfold(text: &str) -> Vec<String> {
+pub(crate) fn unfold(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in text.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
         if (line.starts_with(' ') || line.starts_with('\t')) && !out.is_empty() {

@@ -31,16 +31,29 @@
 
   {#if app.view === "calendar"}
     <nav class="scroll" aria-label="Calendars">
-      <div class="cal-head"><span>Calendars</span><button class="icon-btn" onclick={() => (cal.calendarDialog = "new")} aria-label="New calendar" title="New calendar"><Icon name="plus" size={14} /></button></div>
+      <div class="cal-head">
+        <span>Calendars</span>
+        <span class="cal-tools">
+          {#if cal.hasSynced}
+            <button class="icon-btn" onclick={() => cal.sync()} disabled={cal.syncing} aria-label="Sync calendars" title="Sync with Google and iCloud now"><Icon name={cal.syncing ? "loader" : "refresh"} size={14} /></button>
+          {/if}
+          <button class="icon-btn" onclick={() => cal.openConnect()} aria-label="Connect Google or iCloud calendars" title="Connect Google or iCloud calendars"><Icon name="link" size={14} /></button>
+          <button class="icon-btn" onclick={() => (cal.calendarDialog = "new")} aria-label="New calendar" title="New calendar"><Icon name="plus" size={14} /></button>
+        </span>
+      </div>
       {#each cal.calendars as c (c.id)}
         <div class="calrow">
           <button class="vis" role="checkbox" aria-checked={c.visible} aria-label="Show {c.name}" onclick={() => cal.toggleVisible(c)}>
             <span class="box" class:on={c.visible} style:--c={c.color}>{#if c.visible}<Icon name="check" size={11} />{/if}</span>
           </button>
           <span class="label" class:off={!c.visible}>{c.name}</span>
+          {#if c.last_sync_error}<span class="warn" title="Last sync failed: {c.last_sync_error}"><Icon name="warning" size={13} /></span>{/if}
           <button class="icon-btn small" onclick={() => (cal.calendarDialog = c)} aria-label="Edit {c.name}" title="Edit calendar"><Icon name="sliders" size={13} /></button>
         </div>
       {/each}
+      {#if cal.hasSynced}
+        <button class="btn sm ghost loglink" onclick={() => cal.openLog()}>Sync log</button>
+      {/if}
       <label class="weekstart">Week starts on
         <select class="input" value={cal.weekStart} onchange={(e) => cal.setWeekStart(Number(e.currentTarget.value) === 1 ? 1 : 0)}>
           <option value={0}>Sunday</option>
@@ -108,6 +121,9 @@
   .modes button { display: flex; gap: 6px; align-items: center; justify-content: center; border: 0; background: transparent; color: var(--fg-1); padding: 5px 6px; border-radius: 4px; cursor: pointer; }
   .modes button:hover { color: var(--fg-0); }
   .modes button.on { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
+  .cal-tools { display: inline-flex; gap: 2px; }
+  .warn { color: var(--danger); display: inline-flex; }
+  .loglink { margin: 6px 8px 0; }
   .cal-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 4px; color: var(--fg-2); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; }
   .calrow { display: flex; align-items: center; gap: 8px; padding: 3px 4px 3px 8px; border-radius: var(--radius-sm); }
   .calrow:hover { background: var(--bg-2); }

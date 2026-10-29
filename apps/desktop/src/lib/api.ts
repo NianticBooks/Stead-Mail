@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  Account, AddAccountInput, AiConfig, AiStatus, Analysis, AuditReport, CalEvent, Calendar, EventInput, ImportReport, Occurrence, CloudPreview, DraftResult, EventProposal, ProviderKind, CalendarSummary, ConnectionReport, Mailbox, MessageDetail, MessageRow, OAuthIdentity,
+  Account, AddAccountInput, AiConfig, AiStatus, Analysis, AuditReport, CalEvent, CalSyncReport, Calendar, EventInput, RemoteList, SyncLogEntry, ImportReport, Occurrence, CloudPreview, DraftResult, EventProposal, ProviderKind, CalendarSummary, ConnectionReport, Mailbox, MessageDetail, MessageRow, OAuthIdentity,
   OutboxItem, SanitizedHtml, SavedAttachment, SearchHit, SendOutcome, SyncReport,
 } from "./types";
 
@@ -80,6 +80,12 @@ export const api = {
   calendarConflicts: (start: string, end: string | null, exclude?: string) => rpc<Occurrence[]>("calendar.conflicts", { start, end, exclude }),
   calendarExport: (id: string) => rpc<string>("calendar.export", { id }),
   calendarImport: (id: string, ics: string) => rpc<ImportReport>("calendar.import", { id, ics }),
+  calendarRemote: () => rpc<RemoteList>("calendar.remote"),
+  calendarLink: (source: string, account_id: string, remote_id: string) => rpc<Calendar>("calendar.link", { source, account_id, remote_id }),
+  calendarUnlink: (id: string) => rpc<Record<string, never>>("calendar.unlink", { id }),
+  calendarSync: (calendar?: string) => rpc<CalSyncReport[]>("calendar.sync", { calendar }),
+  syncLog: (limit = 100) => rpc<SyncLogEntry[]>("sync.log", { limit }),
+  syncLogClear: () => rpc<Record<string, never>>("sync.log_clear"),
   eventCreate: (e: EventInput) => rpc<CalEvent>("event.create", { ...e }),
   eventUpdate: (id: string, event: EventInput) => rpc<CalEvent>("event.update", { id, event }),
   eventDelete: (id: string, instance?: string) => rpc<CalEvent | null>("event.delete", { id, instance }),

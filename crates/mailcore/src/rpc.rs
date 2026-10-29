@@ -139,6 +139,25 @@ struct StrIdParams {
 }
 
 #[derive(Deserialize)]
+struct CalendarSyncParams {
+    #[serde(default)]
+    calendar: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CalendarLinkParams {
+    source: String,
+    account_id: String,
+    remote_id: String,
+}
+
+#[derive(Deserialize)]
+struct SyncLogParams {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct CalendarCreateParams {
     name: String,
     color: String,
@@ -367,6 +386,28 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
                 let p: ImportParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.calendar_import(&p.id, &p.ics)?)
             }
+            "calendar.remote" => to_json(&api.calendar_remote_list().await?),
+            "calendar.link" => {
+                let p: CalendarLinkParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.calendar_link(&p.source, &p.account_id, &p.remote_id).await?)
+            }
+            "calendar.unlink" => {
+                let p: StrIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                api.calendar_unlink(&p.id)?;
+                to_json(&serde_json::json!({"ok": true}))
+            }
+            "calendar.sync" => {
+                let p: CalendarSyncParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.calendar_sync(p.calendar.as_deref()).await?)
+            }
+            "sync.log" => {
+                let p: SyncLogParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.sync_log(p.limit.unwrap_or(100))?)
+            }
+            "sync.log_clear" => {
+                api.sync_log_clear()?;
+                to_json(&serde_json::json!({"ok": true}))
+            }
             "event.get" => {
                 let p: StrIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.event_get(&p.id)?)
@@ -589,6 +630,12 @@ mod tests {
         let created = call("event.create", json!({"title": "Lunch", "start": "2026-10-29T12:00", "tz": "America/Chicago"})).await.result.unwrap();
         assert_eq!(created["start_utc"], "2026-10-29T17:00:00Z");
         let id = created["id"].as_str().unwrap().to_string();
+        // Sync methods exist and behave with nothing linked.
+        assert_eq!(call("calendar.sync", json!({})).await.result.unwrap(), json!([]));
+        assert_eq!(call("sync.log", json!({"limit": 5})).await.result.unwrap(), json!([]));
+        assert!(call("calendar.sync", json!({"calendar": "personal"})).await.error.is_some(), "a local calendar cannot be synced");
+        assert!(call("calendar.unlink", json!({"id": "personal"})).await.error.is_some());
+        assert!(call("calendar.link", json!({"source": "google", "account_id": "x", "remote_id": "y"})).await.error.is_some());
         let range = call("calendar.range", json!({"from": "2026-10-29T00:00:00Z", "to": "2026-10-30T00:00:00Z"})).await.result.unwrap();
         assert_eq!(range[0]["title"], "Lunch");
         assert_eq!(range[0]["color"], "#7aa2f7");

@@ -68,6 +68,12 @@ impl Api {
         let store = self.store();
         let current = db::event(&store.conn, id)?;
         check_writable(&store.conn, &current.calendar_id)?;
+        if let Some(target) = input.calendar_id.as_deref().filter(|c| *c != current.calendar_id) {
+            let synced = |cal: &str| db::calendar(&store.conn, cal).map(|c| c.kind != "local");
+            if synced(target)? || synced(&current.calendar_id)? {
+                return Err(Error::Invalid("events cannot be moved to or from a Google or iCloud calendar yet; copy it instead".into()));
+            }
+        }
         let ev = build_event(&store.conn, &input, Some(&current), tz)?;
         db::put_event(&store.conn, &ev, None)?;
         db::event(&store.conn, id)

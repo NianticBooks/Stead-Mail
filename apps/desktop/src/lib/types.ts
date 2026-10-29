@@ -200,6 +200,45 @@ export interface Calendar {
   kind: "local" | "google" | "caldav";
   read_only: boolean;
   visible: boolean;
+  last_sync_at: string | null;
+  last_sync_error: string | null;
+}
+
+/** A calendar a Google or iCloud account offers. */
+export interface RemoteCalendar {
+  source: "google" | "caldav";
+  account: string;
+  account_id: string;
+  remote_id: string;
+  name: string;
+  color: string | null;
+  read_only: boolean;
+  linked_to: string | null;
+}
+
+export interface RemoteList {
+  calendars: RemoteCalendar[];
+  errors: string[];
+}
+
+export interface CalSyncReport {
+  calendar: string;
+  pulled: number;
+  removed: number;
+  pushed: number;
+  conflicts: number;
+  skipped: string[];
+  errors: string[];
+}
+
+export interface SyncLogEntry {
+  id: number;
+  at: string;
+  calendar_id: string | null;
+  calendar: string;
+  kind: "conflict" | "error" | "info" | "deleted";
+  title: string;
+  detail: string;
 }
 
 export interface CalEvent {

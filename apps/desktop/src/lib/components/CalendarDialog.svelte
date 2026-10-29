@@ -17,6 +17,15 @@
   const validColor = $derived(/^#[0-9a-fA-F]{6}$/.test(color));
   const localCount = $derived(cal.calendars.filter((c) => c.kind === "local").length);
   const canDelete = $derived(!!existing && existing.kind === "local" && localCount > 1);
+  const synced = $derived(!!existing && existing.kind !== "local");
+  let confirmUnlink = $state(false);
+
+  async function unlink() {
+    if (!existing) return;
+    busy = true;
+    error = await cal.unlinkCalendar(existing);
+    busy = false;
+  }
 
   async function save() {
     if (!name.trim() || !validColor || busy) return;
@@ -60,6 +69,13 @@
           <input class="input hex" bind:value={color} spellcheck="false" aria-label="Hex colour" aria-invalid={!validColor} />
         </div>
       </div>
+      {#if existing && synced}
+        <p class="muted small note">
+          Synced with {existing.kind === "google" ? "Google" : "iCloud / CalDAV"}{existing.read_only ? " (read-only)" : ""}.
+          {existing.last_sync_error ? `Last sync failed: ${existing.last_sync_error}` : existing.last_sync_at ? "Last synced " + new Date(existing.last_sync_at).toLocaleString() + "." : "Not synced yet."}
+          Renaming or recolouring affects only this app.
+        </p>
+      {/if}
       {#if existing}
         <div class="tools">
           <button type="button" class="btn sm" onclick={() => cal.exportCalendar(existing)}><Icon name="download" size={14} /> Export .ics</button>
@@ -69,7 +85,15 @@
       {#if error}<div class="problem" role="alert">{error}</div>{/if}
     </div>
     <footer>
-      {#if existing}
+      {#if existing && synced}
+        {#if confirmUnlink}
+          <span class="muted small">Stop syncing? The server keeps its copy; unsynced edits here are lost.</span>
+          <button type="button" class="btn sm danger" onclick={unlink} disabled={busy}>Yes, stop</button>
+          <button type="button" class="btn sm ghost" onclick={() => (confirmUnlink = false)}>Keep</button>
+        {:else}
+          <button type="button" class="btn sm danger" onclick={() => (confirmUnlink = true)} disabled={busy}><Icon name="link" size={14} /> Stop syncing</button>
+        {/if}
+      {:else if existing}
         {#if confirmDelete}
           <span class="muted small">Delete it and all its events?</span>
           <button type="button" class="btn sm danger" onclick={remove} disabled={busy}>Yes, delete</button>
@@ -98,5 +122,6 @@
   .tools { display: flex; gap: 8px; }
   .problem { color: var(--danger); font-size: 12.5px; }
   .small { font-size: 12.5px; }
+  .note { margin: 0; }
   footer { display: flex; gap: 8px; align-items: center; padding: 10px 16px; border-top: 1px solid var(--line); }
 </style>

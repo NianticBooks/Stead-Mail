@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, AuthKind, Provider, ServerConfig};
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE accounts (
@@ -285,6 +285,25 @@ SELECT lower(hex(randomblob(16))), 'personal',
        all_day, tz, rrule, attendees, source_proposal_id, source_message_id, created_at
 FROM calendar_events;
 DROP TABLE calendar_events;
+"#;
+
+/// Two-way calendar sync: a log of what sync did to the user's data (conflicts above all), plus
+/// the calendar-side bookkeeping. `extra` keeps parts of a remote event we do not model (alarms,
+/// overridden occurrences) so that pushing an edit does not delete them from the server.
+const MIGRATION_V10: &str = r#"
+CREATE TABLE sync_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    calendar_id   TEXT,
+    calendar_name TEXT NOT NULL DEFAULT '',
+    kind          TEXT NOT NULL,
+    title         TEXT NOT NULL DEFAULT '',
+    detail        TEXT NOT NULL DEFAULT ''
+);
+ALTER TABLE events ADD COLUMN extra TEXT;
+ALTER TABLE calendars ADD COLUMN last_sync_at TEXT;
+ALTER TABLE calendars ADD COLUMN last_sync_error TEXT;
+CREATE INDEX events_by_remote ON events(calendar_id, remote_id);
 "#;
 
 /// Triage can flag a message that tried to instruct an AI.
@@ -630,6 +649,9 @@ impl Store {
         }
         if version < 9 {
             tx.execute_batch(MIGRATION_V9)?;
+        }
+        if version < 10 {
+            tx.execute_batch(MIGRATION_V10)?;
         }
         if version < SCHEMA_VERSION {
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -1357,6 +1379,14 @@ fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sync_bookkeeping_columns_exist() {
+        let s = Store::open_in_memory().unwrap();
+        s.conn.execute("INSERT INTO sync_log (kind) VALUES ('info')", []).unwrap();
+        s.conn.execute("UPDATE events SET extra = NULL", []).unwrap();
+        s.conn.execute("UPDATE calendars SET last_sync_at = NULL, last_sync_error = NULL", []).unwrap();
+    }
+
     use super::*;
 
     #[test]

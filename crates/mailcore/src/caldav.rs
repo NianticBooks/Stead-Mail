@@ -86,6 +86,120 @@ impl CalDavClient {
         Err(Error::CalDav("too many redirects".into()))
     }
 
+    /// Any WebDAV request with manual redirects. Returns status, ETag header and body.
+    async fn dav(&self, method: &str, url: &Url, headers: &[(&str, &str)], body: Option<String>) -> Result<(u16, Option<String>, String)> {
+        let mut url = url.clone();
+        for _ in 0..5 {
+            let mut req = self.http.request(reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| Error::CalDav(e.to_string()))?, url.clone()).basic_auth(&self.username, Some(&self.password));
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            if let Some(b) = &body {
+                req = req.body(b.clone());
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            if status.is_redirection() {
+                let loc = resp.headers().get("location").and_then(|v| v.to_str().ok()).ok_or_else(|| Error::CalDav(format!("redirect {status} without Location")))?;
+                url = url.join(loc).map_err(|e| Error::CalDav(e.to_string()))?;
+                continue;
+            }
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return Err(Error::CalDav(format!("authentication failed ({status}) for {}", self.username)));
+            }
+            let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(String::from);
+            return Ok((status.as_u16(), etag, resp.text().await?));
+        }
+        Err(Error::CalDav("too many redirects".into()))
+    }
+
+    fn collection_url(&self, collection: &str) -> Result<Url> {
+        Url::parse(collection).map_err(|e| Error::CalDav(format!("bad calendar url: {e}")))
+    }
+
+    /// The collection's change tag; it differs whenever anything in the calendar changed.
+    pub async fn ctag(&self, collection: &str) -> Result<Option<String>> {
+        let url = self.collection_url(collection)?;
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:prop><cs:getctag/></d:prop></d:propfind>"#;
+        let xml = self.propfind(&url, 0, body).await?;
+        let doc = roxmltree::Document::parse(&xml).map_err(|e| Error::CalDav(format!("bad xml: {e}")))?;
+        Ok(doc.descendants().find(|n| n.has_tag_name((NS_CS, "getctag"))).and_then(|n| n.text()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+    }
+
+    /// Every event resource in the collection with its ETag: (absolute URL, etag).
+    pub async fn list_etags(&self, collection: &str) -> Result<Vec<(String, String)>> {
+        let url = self.collection_url(collection)?;
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:getetag/><d:resourcetype/></d:prop></d:propfind>"#;
+        let xml = self.propfind(&url, 1, body).await?;
+        parse_etags(&xml, &url)
+    }
+
+    /// Fetch the iCalendar text of the given resources: (absolute URL, etag, text).
+    pub async fn multiget(&self, collection: &str, hrefs: &[String]) -> Result<Vec<(String, String, String)>> {
+        let url = self.collection_url(collection)?;
+        let mut out = Vec::new();
+        for chunk in hrefs.chunks(40) {
+            let list: String = chunk
+                .iter()
+                .filter_map(|h| Url::parse(h).ok())
+                .map(|u| format!("<d:href>{}</d:href>", xml_escape(u.path())))
+                .collect();
+            let body = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?><c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop>{list}</c:calendar-multiget>"#
+            );
+            let (status, _, text) = self.dav("REPORT", &url, &[("Depth", "1"), ("Content-Type", "application/xml; charset=utf-8")], Some(body)).await?;
+            if !(status == 207 || (200..300).contains(&status)) {
+                return Err(Error::CalDav(format!("REPORT returned {status}: {}", text.chars().take(200).collect::<String>())));
+            }
+            out.extend(parse_multiget(&text, &url)?);
+        }
+        Ok(out)
+    }
+
+    /// Write an event resource. `etag` Some = replace that version; None = create, refusing to
+    /// overwrite. Returns the new ETag if the server gives one.
+    pub async fn put(&self, href: &str, ics: &str, etag: Option<&str>) -> Result<Option<String>> {
+        let url = self.collection_url(href)?;
+        let cond = match etag {
+            Some(e) => ("If-Match", e),
+            None => ("If-None-Match", "*"),
+        };
+        let (status, new_etag, text) = self.dav("PUT", &url, &[("Content-Type", "text/calendar; charset=utf-8"), cond], Some(ics.to_string())).await?;
+        match status {
+            200..=299 => {}
+            412 => return Err(Error::CalDav("412 changed on the server".into())),
+            s => return Err(Error::CalDav(format!("PUT {href} returned {s}: {}", text.chars().take(200).collect::<String>()))),
+        }
+        if new_etag.is_some() {
+            return Ok(new_etag);
+        }
+        // Some servers do not return the ETag of what they stored.
+        Ok(self.etag_of(href).await.ok().flatten())
+    }
+
+    pub async fn etag_of(&self, href: &str) -> Result<Option<String>> {
+        let url = self.collection_url(href)?;
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>"#;
+        let xml = self.propfind(&url, 0, body).await?;
+        let doc = roxmltree::Document::parse(&xml).map_err(|e| Error::CalDav(format!("bad xml: {e}")))?;
+        Ok(doc.descendants().find(|n| n.has_tag_name((NS_DAV, "getetag"))).and_then(|n| n.text()).map(|s| s.trim().to_string()))
+    }
+
+    /// Delete a resource; already gone counts as done.
+    pub async fn remove(&self, href: &str, etag: Option<&str>) -> Result<()> {
+        let url = self.collection_url(href)?;
+        let mut headers = vec![];
+        if let Some(e) = etag {
+            headers.push(("If-Match", e));
+        }
+        let (status, _, text) = self.dav("DELETE", &url, &headers, None).await?;
+        match status {
+            200..=299 | 404 | 410 => Ok(()),
+            412 => Err(Error::CalDav("412 changed on the server".into())),
+            s => Err(Error::CalDav(format!("DELETE {href} returned {s}: {}", text.chars().take(200).collect::<String>()))),
+        }
+    }
+
     pub async fn discover(&self) -> Result<CalDavHome> {
         let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"#;
         let xml = self.propfind(&self.base, 0, body).await?;
@@ -113,6 +227,45 @@ impl CalDavClient {
         }
         Ok(cals)
     }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn abs(base: &Url, href: &str) -> Option<String> {
+    base.join(href.trim()).ok().map(|u| u.to_string())
+}
+
+/// (absolute URL, etag) for every non-collection resource in a depth-1 listing.
+pub fn parse_etags(xml: &str, base: &Url) -> Result<Vec<(String, String)>> {
+    let doc = roxmltree::Document::parse(xml).map_err(|e| Error::CalDav(format!("bad multistatus xml: {e}")))?;
+    let mut out = Vec::new();
+    for resp in doc.descendants().filter(|n| n.has_tag_name((NS_DAV, "response"))) {
+        let Some(href) = resp.children().find(|n| n.has_tag_name((NS_DAV, "href"))).and_then(|n| n.text()) else { continue };
+        let is_collection = resp.descendants().any(|n| n.has_tag_name((NS_DAV, "collection")));
+        let etag = resp.descendants().find(|n| n.has_tag_name((NS_DAV, "getetag"))).and_then(|n| n.text()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if let (false, Some(etag), Some(url)) = (is_collection, etag, abs(base, href)) {
+            out.push((url, etag));
+        }
+    }
+    Ok(out)
+}
+
+/// (absolute URL, etag, calendar text) from a calendar-multiget answer. Resources the server
+/// reports as missing are left out.
+pub fn parse_multiget(xml: &str, base: &Url) -> Result<Vec<(String, String, String)>> {
+    let doc = roxmltree::Document::parse(xml).map_err(|e| Error::CalDav(format!("bad multistatus xml: {e}")))?;
+    let mut out = Vec::new();
+    for resp in doc.descendants().filter(|n| n.has_tag_name((NS_DAV, "response"))) {
+        let Some(href) = resp.children().find(|n| n.has_tag_name((NS_DAV, "href"))).and_then(|n| n.text()) else { continue };
+        let data = resp.descendants().find(|n| n.has_tag_name((NS_CALDAV, "calendar-data"))).and_then(|n| n.text());
+        let etag = resp.descendants().find(|n| n.has_tag_name((NS_DAV, "getetag"))).and_then(|n| n.text()).map(|s| s.trim().to_string());
+        if let (Some(data), Some(etag), Some(url)) = (data, etag, abs(base, href)) {
+            out.push((url, etag, data.to_string()));
+        }
+    }
+    Ok(out)
 }
 
 /// First `<d:href>` inside the named property of a multistatus response.

@@ -209,6 +209,28 @@ enum CalCmd {
         #[arg(long)]
         end: Option<String>,
     },
+    /// List the calendars your Google and iCloud accounts offer, and which are linked here.
+    Remote,
+    /// Mirror a Google or iCloud calendar here (by its name). Nothing changes on the server.
+    Link {
+        /// The calendar's name as `cal remote` shows it.
+        name: String,
+        /// Pick the account when two calendars share a name.
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Stop mirroring a linked calendar and drop the local copy. The server keeps everything.
+    Unlink { calendar: String },
+    /// Sync linked calendars (all, or one). Pulls first; where both sides changed, the server wins.
+    Sync { calendar: Option<String> },
+    /// What sync did to your data: conflicts, removals and errors.
+    Log {
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        /// Empty the log.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Import an .ics file into a calendar.
     Import {
         file: std::path::PathBuf,
@@ -645,7 +667,7 @@ async fn main() -> Result<()> {
             }),
             GoogleCmd::Logout { account } => out(cli.json, &api.google_logout(&account)?, |i| println!("removed {} and its stored tokens", i.email)),
         },
-        Cmd::Cal { cmd } => cal_command(&api, cmd, cli.json)?,
+        Cmd::Cal { cmd } => cal_command(&api, cmd, cli.json).await?,
         Cmd::Ai { cmd } => ai_command(&api, cmd, cli.json).await?,
         Cmd::Serve { socket, socket_path } => {
             let path = socket_path.or_else(|| socket.then(mailcore::socket_path));
@@ -849,15 +871,85 @@ fn fmt_opt<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
 }
 
-fn cal_command(api: &Api, cmd: CalCmd, json: bool) -> anyhow::Result<()> {
+async fn cal_command(api: &Api, cmd: CalCmd, json: bool) -> anyhow::Result<()> {
     use mailcore::calendar::EventInput;
     match cmd {
         CalCmd::List => okout(json, &api.calendars()?, |l| {
             for c in l {
-                println!("{:<12} {}  {}{}{}", c.id, c.color, c.name, if c.visible { "" } else { "  (hidden)" }, if c.read_only { "  (read-only)" } else { "" });
+                let sync = match (c.kind.as_str(), &c.last_sync_error, &c.last_sync_at) {
+                    ("local", _, _) => String::new(),
+                    (k, Some(e), _) => format!("  [{k}: sync failed: {e}]"),
+                    (k, None, Some(at)) => format!("  [{k}: synced {at}]"),
+                    (k, None, None) => format!("  [{k}: not synced yet]"),
+                };
+                println!("{:<12} {}  {}{}{}{}", c.id, c.color, c.name, if c.visible { "" } else { "  (hidden)" }, if c.read_only { "  (read-only)" } else { "" }, sync);
             }
         }),
         CalCmd::New { name, color } => okout(json, &api.calendar_create(&name, &color)?, |c| println!("created {} ({})", c.name, c.id)),
+        CalCmd::Remote => okout(json, &api.calendar_remote_list().await?, |l| {
+            for c in &l.calendars {
+                println!("{:<7} {:<28} {}{}{}", c.source, c.account, c.name, if c.read_only { "  (read-only)" } else { "" }, if c.linked_to.is_some() { "  [linked]" } else { "" });
+            }
+            for e in &l.errors {
+                eprintln!("could not list: {e}");
+            }
+            if l.calendars.is_empty() && l.errors.is_empty() {
+                println!("no Google or iCloud accounts. add one with: mailcore google login / mailcore account add");
+            }
+        }),
+        CalCmd::Link { name, account } => {
+            let list = api.calendar_remote_list().await?;
+            let hits: Vec<_> = list
+                .calendars
+                .iter()
+                .filter(|c| c.name.eq_ignore_ascii_case(&name) && account.as_ref().is_none_or(|a| c.account.eq_ignore_ascii_case(a)))
+                .collect();
+            let c = match hits.as_slice() {
+                [one] => *one,
+                [] => anyhow::bail!("no calendar named '{name}' (see: mailcore cal remote)"),
+                many => anyhow::bail!("{} calendars are named '{name}'; add --account ({})", many.len(), many.iter().map(|c| c.account.as_str()).collect::<Vec<_>>().join(", ")),
+            };
+            let cal = api.calendar_link(&c.source, &c.account_id, &c.remote_id).await?;
+            okout(json, &cal, |c| println!("linked {} ({}). run: mailcore cal sync", c.name, c.id))
+        }
+        CalCmd::Unlink { calendar } => {
+            let id = api.calendars()?.into_iter().find(|c| c.id == calendar || c.name.eq_ignore_ascii_case(&calendar)).map(|c| c.id).ok_or_else(|| anyhow::anyhow!("no calendar '{calendar}'"))?;
+            api.calendar_unlink(&id)?;
+            okout(json, &serde_json::json!({"ok": true}), |_| println!("unlinked; the server's copy is untouched"))
+        }
+        CalCmd::Sync { calendar } => {
+            let id = match calendar {
+                Some(c) => Some(api.calendars()?.into_iter().find(|x| x.id == c || x.name.eq_ignore_ascii_case(&c)).map(|x| x.id).ok_or_else(|| anyhow::anyhow!("no calendar '{c}'"))?),
+                None => None,
+            };
+            okout(json, &api.calendar_sync(id.as_deref()).await?, |l| {
+                if l.is_empty() {
+                    println!("no linked calendars. see: mailcore cal remote");
+                }
+                for r in l {
+                    println!("{}: {} pulled, {} removed, {} sent, {} conflict(s)", r.calendar, r.pulled, r.removed, r.pushed, r.conflicts);
+                    for s in &r.skipped {
+                        println!("  skipped: {s}");
+                    }
+                    for e in &r.errors {
+                        println!("  error: {e}");
+                    }
+                }
+            })
+        }
+        CalCmd::Log { limit, clear } => {
+            if clear {
+                api.sync_log_clear()?;
+            }
+            okout(json, &api.sync_log(limit)?, |l| {
+                if l.is_empty() {
+                    println!("the sync log is empty");
+                }
+                for e in l {
+                    println!("{}  {:<8} {}  {}\n    {}", e.at, e.kind, e.calendar, e.title, e.detail.replace('\n', "\n    "));
+                }
+            })
+        }
         CalCmd::Agenda { days, from } => {
             let from = match from {
                 Some(f) => f,

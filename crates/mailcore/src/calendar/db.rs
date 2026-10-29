@@ -6,9 +6,9 @@ use super::model::{Calendar, Event};
 use crate::error::{Error, Result};
 use crate::store::Store;
 
-const EVENT_COLS: &str = "id, calendar_id, uid, title, description, location, start_utc, end_utc, all_day, tz, rrule, exdates, status, organizer, attendees, source_message_id, sequence, updated_at";
+pub(super) const EVENT_COLS: &str = "id, calendar_id, uid, title, description, location, start_utc, end_utc, all_day, tz, rrule, exdates, status, organizer, attendees, source_message_id, sequence, updated_at";
 
-fn row_to_event(r: &Row<'_>) -> rusqlite::Result<Event> {
+pub(super) fn row_to_event(r: &Row<'_>) -> rusqlite::Result<Event> {
     let exdates: String = r.get(11)?;
     let attendees: String = r.get(14)?;
     Ok(Event {
@@ -34,10 +34,10 @@ fn row_to_event(r: &Row<'_>) -> rusqlite::Result<Event> {
 }
 
 fn row_to_calendar(r: &Row<'_>) -> rusqlite::Result<Calendar> {
-    Ok(Calendar { id: r.get(0)?, name: r.get(1)?, color: r.get(2)?, kind: r.get(3)?, read_only: r.get::<_, i64>(4)? != 0, visible: r.get::<_, i64>(5)? != 0 })
+    Ok(Calendar { id: r.get(0)?, name: r.get(1)?, color: r.get(2)?, kind: r.get(3)?, read_only: r.get::<_, i64>(4)? != 0, visible: r.get::<_, i64>(5)? != 0, last_sync_at: r.get(6)?, last_sync_error: r.get(7)? })
 }
 
-const CAL_COLS: &str = "id, name, color, kind, read_only, visible";
+const CAL_COLS: &str = "id, name, color, kind, read_only, visible, last_sync_at, last_sync_error";
 
 pub fn calendars(conn: &Connection) -> Result<Vec<Calendar>> {
     let mut stmt = conn.prepare(&format!("SELECT {CAL_COLS} FROM calendars ORDER BY rowid"))?;

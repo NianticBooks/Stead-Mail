@@ -6,9 +6,15 @@
 //! migration to events.
 
 pub mod api;
+pub mod dav;
 pub mod db;
+pub mod gcal;
 pub mod ical;
 pub mod model;
 pub mod recur;
+pub mod sync;
+pub mod syncdb;
+#[cfg(test)]
+pub(crate) mod testserver;
 
 pub use model::{Calendar, Event, EventInput, Occurrence};

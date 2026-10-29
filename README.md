@@ -19,11 +19,38 @@ Service / Keychain with an encrypted-file fallback; hybrid AI (local Ollama for 
 triage, cloud for drafting) with 100% human-in-the-loop; Google Calendar REST + iCloud CalDAV
 two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
+## Phase 6 (two-way calendar sync) — what exists
+
+- **Linked calendars.** `mailcore cal remote` lists what your Google and iCloud accounts offer; `cal link "Name"`
+  mirrors one as a local calendar (`kind` google or caldav). Linking never changes the server. `cal unlink` drops the
+  local copy only. In the GUI: the link button in the Calendars header opens "Connect calendars".
+- **Pull first, then push.** Google uses `syncToken` deltas (first sync reaches back 90 days; an expired token
+  triggers a clean resync). CalDAV compares the collection's change tag, then ETags, and fetches only what changed.
+  Local creates, edits and deletes are sent with `If-Match`, so the server refuses a write over a version we never saw.
+- **Remote wins, visibly.** When the same event changed on both sides, the server's version is kept and the log records
+  both versions ("Yours: … / Server: …"). The same goes for deleted-there/edited-here and deleted-here/changed-there
+  (the event comes back, logged). Nothing is lost silently: `mailcore cal log` or the GUI's Sync log.
+- **Fidelity.** Alarms and changed single occurrences of an iCloud series are kept verbatim and written back on edit,
+  so an edit here does not delete a reminder there. Google single-occurrence removals become exceptions here.
+  Pushing never sends invitations (`sendUpdates=none`). Retried creates cannot duplicate (Google ids derive from ours).
+- **When it runs:** `s` in the calendar, the refresh button, `mailcore cal sync`, on first opening the calendar, and
+  every five minutes while the app is open. One sync at a time; a failing calendar reports its error and the others
+  still sync (a warning mark in the sidebar, details in the log).
+- **Migration v10:** `sync_log`, `events.extra`, per-calendar last-sync status. **RPC:** `calendar.remote/link/unlink/sync`,
+  `sync.log`, `sync.log_clear`. `MAILCORE_CALDAV_URL` points CalDAV at another server (tests, self-hosting).
+- **Not done:** editing one occurrence of a series (Google "this event only" changes are reported as skipped), moving
+  an event between calendars, reminders, read-only detection for shared iCloud calendars (a refused write shows in the
+  log), a push that loses a race (reconciled on the next sync with the server winning), macOS.
+- Verified: 162 Rust tests (stateful fake Google and CalDAV servers: first sync, token reuse, expired token, push with
+  ETags, every conflict shape, alarms/overrides round trip, ctag skip, error isolation), the real binary against a
+  local CalDAV fake (link, pull, push, server edit), and the app: sync, conflict log and Connect dialog.
+  A read-only `cal remote` against the real accounts listed both; no real calendar was linked or written.
+
 ## Phase 5 (local calendar) — what exists
 
 - **Calendars and events** live in SQLite (migration v9). A default local "Personal" calendar exists from the start;
   the old accepted-proposal table is folded into it. Events carry what two-way sync needs (remote id, etag, dirty
-  flag, tombstone), so Phase 6 adds no migration to events.
+  flag, tombstone), which Phase 6 uses.
 - **Time zones done properly.** An event keeps the IANA zone its wall clock belongs to and instants are stored in
   UTC. "Every Thursday at 9 AM" stays 9 AM across Daylight Saving changes (tested across both transitions).
   All-day events span whole local days with an exclusive end, so a three-day trip over a DST change is three days.
@@ -46,8 +73,7 @@ two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 - Verified: 148 Rust tests (recurrence across DST, ICS round trips, migration from a real v8 schema, RPC), 60
   frontend tests run under four machine time zones, and the real app driven in a throwaway profile (all four
   views, new-event overlap warning, save, series dialog, Escape, switching sections).
-- **Not verified / not done:** sync with Google Calendar and iCloud CalDAV (Phase 6: remote wins, conflicts logged
-  visibly), accepting a proposal through the live AI card, drag to move or resize, reminders, RECURRENCE-ID overrides,
+- **Not verified / not done:** accepting a proposal through the live AI card, drag to move or resize, reminders, RECURRENCE-ID overrides,
   macOS.
 
 ## Phase 4 (AI layer) — what exists
