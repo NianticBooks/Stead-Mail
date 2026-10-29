@@ -664,7 +664,7 @@ async fn main() -> Result<()> {
                     (false, true) => "todos",
                     _ => "?",
                 };
-                println!("  {:<28} {:<13} {}", c.display_name, kinds, c.href);
+                println!("  {:<28} {:<13} {}{}", c.display_name, kinds, c.href, if c.read_only { "  (read-only)" } else { "" });
             }
         }),
         Cmd::Google { cmd } => match cmd {

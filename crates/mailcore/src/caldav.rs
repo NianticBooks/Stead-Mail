@@ -27,6 +27,8 @@ pub struct CalDavCalendar {
     pub color: Option<String>,
     pub supports_events: bool,
     pub supports_todos: bool,
+    /// The server says this user may not write here (a shared calendar offered read-only).
+    pub read_only: bool,
 }
 
 pub struct CalDavClient {
@@ -217,7 +219,7 @@ impl CalDavClient {
 
     pub async fn list_calendars(&self, home: &str) -> Result<Vec<CalDavCalendar>> {
         let home = Url::parse(home).map_err(|e| Error::CalDav(e.to_string()))?;
-        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/"><d:prop><d:displayname/><d:resourcetype/><cs:getctag/><c:supported-calendar-component-set/><ical:calendar-color/></d:prop></d:propfind>"#;
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/"><d:prop><d:displayname/><d:resourcetype/><cs:getctag/><c:supported-calendar-component-set/><ical:calendar-color/><d:current-user-privilege-set/></d:prop></d:propfind>"#;
         let xml = self.propfind(&home, 1, body).await?;
         let mut cals = parse_calendars(&xml)?;
         for c in &mut cals {
@@ -278,6 +280,17 @@ pub fn parse_single_href(xml: &str, ns: &str, prop: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Read-only when the server lists the user's privileges and none of them allows writing. A server
+/// that does not report privileges is assumed writable; a refused write then shows in the sync log.
+fn is_read_only(resp: &roxmltree::Node<'_, '_>) -> bool {
+    let Some(set) = resp.descendants().find(|n| n.has_tag_name((NS_DAV, "current-user-privilege-set"))) else { return false };
+    let privileges: Vec<&str> = set.descendants().filter(|n| n.is_element()).map(|n| n.tag_name().name()).collect();
+    if privileges.iter().all(|p| matches!(*p, "current-user-privilege-set" | "privilege")) {
+        return false; // an empty answer says nothing
+    }
+    !privileges.iter().any(|p| matches!(*p, "write" | "write-content" | "all" | "bind"))
+}
+
 /// Every `<d:response>` whose resourcetype includes `<c:calendar/>`.
 pub fn parse_calendars(xml: &str) -> Result<Vec<CalDavCalendar>> {
     let doc = roxmltree::Document::parse(xml).map_err(|e| Error::CalDav(format!("bad multistatus xml: {e}")))?;
@@ -311,6 +324,7 @@ pub fn parse_calendars(xml: &str) -> Result<Vec<CalDavCalendar>> {
             color: text_of(NS_APPLE, "calendar-color"),
             supports_events: comps.is_empty() || comps.iter().any(|c| c == "VEVENT"),
             supports_todos: comps.iter().any(|c| c == "VTODO"),
+            read_only: is_read_only(&resp),
         });
     }
     Ok(out)
@@ -334,6 +348,8 @@ mod tests {
 <multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:CS="http://calendarserver.org/ns/" xmlns:ICAL="http://apple.com/ns/ical/">
 <response><href>/123456789/calendars/</href><propstat><prop><displayname>Fred</displayname><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response>
 <response><href>/123456789/calendars/home/</href><propstat><prop><displayname>Home</displayname><resourcetype><collection/><C:calendar/></resourcetype><CS:getctag>ctag-1</CS:getctag><C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set><ICAL:calendar-color>#FF2968FF</ICAL:calendar-color></prop><status>HTTP/1.1 200 OK</status></propstat></response>
+<response><href>/123456789/calendars/shared/</href><propstat><prop><displayname>Shared</displayname><resourcetype><collection/><C:calendar/></resourcetype><C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set><current-user-privilege-set><privilege><read/></privilege><privilege><read-current-user-privilege-set/></privilege></current-user-privilege-set></prop><status>HTTP/1.1 200 OK</status></propstat></response>
+<response><href>/123456789/calendars/mine/</href><propstat><prop><displayname>Mine</displayname><resourcetype><collection/><C:calendar/></resourcetype><C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set><current-user-privilege-set><privilege><read/></privilege><privilege><write/></privilege></current-user-privilege-set></prop><status>HTTP/1.1 200 OK</status></propstat></response>
 <response><href>/123456789/calendars/tasks/</href><propstat><prop><displayname>Reminders</displayname><resourcetype><collection/><C:calendar/></resourcetype><C:supported-calendar-component-set><C:comp name="VTODO"/></C:supported-calendar-component-set></prop><status>HTTP/1.1 200 OK</status></propstat></response>
 <response><href>/123456789/calendars/inbox/</href><propstat><prop><resourcetype><collection/><C:schedule-inbox/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response>
 </multistatus>"#;
@@ -348,12 +364,15 @@ mod tests {
     #[test]
     fn calendars_only_and_component_flags() {
         let cals = parse_calendars(CALS).unwrap();
-        assert_eq!(cals.len(), 2, "collection root and schedule-inbox are skipped");
+        assert_eq!(cals.len(), 4, "collection root and schedule-inbox are skipped");
         assert_eq!(cals[0].display_name, "Home");
+        assert!(!cals[0].read_only, "no privilege information means assume writable");
         assert_eq!(cals[0].ctag.as_deref(), Some("ctag-1"));
         assert_eq!(cals[0].color.as_deref(), Some("#FF2968FF"));
         assert!(cals[0].supports_events && !cals[0].supports_todos);
-        assert_eq!(cals[1].display_name, "Reminders");
-        assert!(!cals[1].supports_events && cals[1].supports_todos);
+        assert_eq!((cals[1].display_name.as_str(), cals[1].read_only), ("Shared", true));
+        assert_eq!((cals[2].display_name.as_str(), cals[2].read_only), ("Mine", false));
+        assert_eq!(cals[3].display_name, "Reminders");
+        assert!(!cals[3].supports_events && cals[3].supports_todos);
     }
 }

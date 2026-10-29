@@ -19,6 +19,13 @@ Service / Keychain with an encrypted-file fallback; hybrid AI (local Ollama for 
 triage, cloud for drafting) with 100% human-in-the-loop; Google Calendar REST + iCloud CalDAV
 two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
+## Phase 10 (read-only detection)
+
+- CalDAV calendars the server offers read-only (the shared-calendar case) are detected from the user's privilege
+  set when listing and linking, so they link as read-only and refuse edits up front instead of failing at push time.
+  A server that does not report privileges is assumed writable; a refused write still shows in the sync log. A
+  calendar linked before this change keeps its old flag: unlink and link it again.
+
 ## Phase 9 (calendar reminders) — what exists
 
 - **Reminders.** Any event can remind you 0 minutes to 7 days before it starts (several per event). They are kept on

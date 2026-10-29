@@ -425,7 +425,7 @@ impl Api {
                     account_id: acc.id.clone(),
                     name: c.display_name,
                     color: c.color,
-                    read_only: false,
+                    read_only: c.read_only,
                     remote_id: c.href,
                 })),
                 Err(e) => out.errors.push(format!("{}: {e}", acc.email)),

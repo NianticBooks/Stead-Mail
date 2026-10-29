@@ -1,6 +1,6 @@
 # Maintainer: Fred Book <claude@nianticbooks.com>
 pkgname=mailcore-git
-pkgver=0.1.0
+pkgver=0.1.0.r10.f8a5cea
 pkgrel=1
 pkgdesc='Dark-mode, AI-native desktop email and calendar client (IMAP, CalDAV, Google Calendar)'
 arch=('x86_64')
@@ -10,6 +10,8 @@ depends=('webkit2gtk-4.1' 'gtk3' 'openssl' 'libsecret')
 makedepends=('git' 'rust' 'nodejs' 'npm')
 optdepends=('ollama: local model for triage and event extraction (AI is off by default)'
             'gnome-keyring: store passwords in the Secret Service instead of an encrypted file')
+# makepkg's default LTO turns the C parts of ring and bundled SQLite into bitcode that rust-lld cannot link.
+options=('!lto')
 provides=('mailcore')
 conflicts=('mailcore')
 # MAILCORE_SRC lets you build a local checkout: MAILCORE_SRC=/path/to/ai-mail-client makepkg -f
