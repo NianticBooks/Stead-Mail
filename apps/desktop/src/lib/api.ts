@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  Account, AddAccountInput, AiConfig, AiStatus, Analysis, AuditReport, CalendarEvent, CloudPreview, DraftResult, EventProposal, ProviderKind, CalendarSummary, ConnectionReport, Mailbox, MessageDetail, MessageRow, OAuthIdentity,
+  Account, AddAccountInput, AiConfig, AiStatus, Analysis, AuditReport, CalEvent, Calendar, EventInput, ImportReport, Occurrence, CloudPreview, DraftResult, EventProposal, ProviderKind, CalendarSummary, ConnectionReport, Mailbox, MessageDetail, MessageRow, OAuthIdentity,
   OutboxItem, SanitizedHtml, SavedAttachment, SearchHit, SendOutcome, SyncReport,
 } from "./types";
 
@@ -66,11 +66,24 @@ export const api = {
   aiTriageFolder: (account: string, mailbox: string, limit = 30) =>
     rpc<{ analyzed: number; skipped: number; failed: number; stopped_early: boolean; errors: string[] }>("ai.triage_folder", { account, mailbox, limit }),
   aiProposals: (account: string, mailbox: string, uid: number) => rpc<EventProposal[]>("ai.proposals", { account, mailbox, uid }),
-  aiAccept: (id: number) => rpc<CalendarEvent>("ai.accept", { id }),
+  aiAccept: (id: number) => rpc<CalEvent>("ai.accept", { id }),
   aiDismiss: (id: number) => rpc<EventProposal>("ai.dismiss", { id }),
   aiDraftPreview: (r: DraftArgs) => rpc<CloudPreview | null>("ai.draft_preview", { ...r }),
   aiDraft: (r: DraftArgs) => rpc<DraftResult>("ai.draft", { ...r }),
   aiAudit: (limit = 20) => rpc<AuditReport>("ai.audit", { limit }),
+
+  calendars: () => rpc<Calendar[]>("calendar.list"),
+  calendarCreate: (name: string, color: string) => rpc<Calendar>("calendar.create", { name, color }),
+  calendarUpdate: (id: string, patch: { name?: string; color?: string; visible?: boolean }) => rpc<Calendar>("calendar.update", { id, ...patch }),
+  calendarDelete: (id: string) => rpc<Record<string, never>>("calendar.delete", { id }),
+  calendarRange: (from: string, to: string, calendars?: string[]) => rpc<Occurrence[]>("calendar.range", { from, to, calendars }),
+  calendarConflicts: (start: string, end: string | null, exclude?: string) => rpc<Occurrence[]>("calendar.conflicts", { start, end, exclude }),
+  calendarExport: (id: string) => rpc<string>("calendar.export", { id }),
+  calendarImport: (id: string, ics: string) => rpc<ImportReport>("calendar.import", { id, ics }),
+  eventCreate: (e: EventInput) => rpc<CalEvent>("event.create", { ...e }),
+  eventUpdate: (id: string, event: EventInput) => rpc<CalEvent>("event.update", { id, event }),
+  eventDelete: (id: string, instance?: string) => rpc<CalEvent | null>("event.delete", { id, instance }),
+  eventGet: (id: string) => rpc<CalEvent>("event.get", { id }),
 
   googleConfigured: () => rpc<{ configured: boolean }>("google.configured"),
   googleConfigure: (client_id: string, client_secret: string | null) => rpc<{ configured: boolean }>("google.configure", { client_id, client_secret }),
@@ -85,4 +98,6 @@ export const shell = {
   reveal: (path: string) => invoke<void>("reveal_file", { path }),
   downloadDir: () => invoke<string>("download_dir"),
   restartWatchers: () => invoke<void>("restart_watchers"),
+  readIcs: (path: string) => invoke<string>("read_ics", { path }),
+  writeIcs: (name: string, text: string) => invoke<string>("write_ics", { name, text }),
 };

@@ -61,6 +61,8 @@ function loadPrefs(): Prefs {
 const errText = (e: unknown) => (typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e));
 
 class App {
+  /** Which half of the app is showing. */
+  view = $state<"mail" | "calendar">("mail");
   accounts = $state<Account[]>([]);
   accountId = $state<string | null>(null);
   mailboxes = $state<Mailbox[]>([]);
@@ -484,14 +486,16 @@ class App {
     }
   }
 
-  async acceptProposal(id: number) {
+  async acceptProposal(id: number): Promise<boolean> {
     try {
       const ev = await api.aiAccept(id);
       this.proposals = this.proposals.map((p) => (p.id === id ? { ...p, state: "accepted" } : p));
       this.#adjustPending(-1);
-      this.toast("success", `Added “${ev.title}” to your calendar`);
+      this.toast("success", `Added “${ev.title}” to your calendar`, { label: "View", run: () => (this.view = "calendar") });
+      return true;
     } catch (e) {
       this.toast("error", errText(e));
+      return false;
     }
   }
 

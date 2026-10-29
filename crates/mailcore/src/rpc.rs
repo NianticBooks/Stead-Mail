@@ -134,6 +134,63 @@ struct KeyParams {
 }
 
 #[derive(Deserialize)]
+struct StrIdParams {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct CalendarCreateParams {
+    name: String,
+    color: String,
+}
+
+#[derive(Deserialize)]
+struct CalendarUpdateParams {
+    id: String,
+    #[serde(flatten)]
+    patch: crate::calendar::api::CalendarPatch,
+}
+
+#[derive(Deserialize)]
+struct EventUpdateParams {
+    id: String,
+    event: crate::calendar::EventInput,
+}
+
+#[derive(Deserialize)]
+struct EventDeleteParams {
+    id: String,
+    instance: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RangeParams {
+    from: String,
+    to: String,
+    calendars: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct ConflictParams {
+    start: String,
+    end: Option<String>,
+    exclude: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportParams {
+    id: String,
+    ics: String,
+}
+
+#[derive(Deserialize)]
+struct EventListParams {
+    calendar: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+#[derive(Deserialize)]
 struct LimitParams {
     account: Option<String>,
     #[serde(default = "default_limit")]
@@ -277,8 +334,54 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
                 to_json(&api.ai_audit(p.limit as usize)?)
             }
             "calendar.events" => {
-                let p: LimitParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
-                to_json(&api.calendar_events(p.limit as usize)?)
+                let p: EventListParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.event_list(p.calendar.as_deref(), p.limit as usize)?)
+            }
+            "calendar.list" => to_json(&api.calendars()?),
+            "calendar.create" => {
+                let p: CalendarCreateParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.calendar_create(&p.name, &p.color)?)
+            }
+            "calendar.update" => {
+                let p: CalendarUpdateParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.calendar_update(&p.id, p.patch)?)
+            }
+            "calendar.delete" => {
+                let p: StrIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                api.calendar_delete(&p.id)?;
+                Ok(serde_json::json!({}))
+            }
+            "calendar.range" => {
+                let p: RangeParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.calendar_range(&p.from, &p.to, p.calendars.as_deref())?)
+            }
+            "calendar.conflicts" => {
+                let p: ConflictParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.calendar_conflicts(&p.start, p.end.as_deref(), p.exclude.as_deref())?)
+            }
+            "calendar.export" => {
+                let p: StrIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.calendar_export(&p.id)?)
+            }
+            "calendar.import" => {
+                let p: ImportParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.calendar_import(&p.id, &p.ics)?)
+            }
+            "event.get" => {
+                let p: StrIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.event_get(&p.id)?)
+            }
+            "event.create" => {
+                let p: crate::calendar::EventInput = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.event_create(p)?)
+            }
+            "event.update" => {
+                let p: EventUpdateParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.event_update(&p.id, p.event)?)
+            }
+            "event.delete" => {
+                let p: EventDeleteParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.event_delete(&p.id, p.instance.as_deref())?)
             }
             "message.get" => {
                 let p: MessageParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
@@ -470,6 +573,33 @@ mod tests {
         let second = serve_unix(api.clone(), &sock).await.unwrap_err();
         assert_eq!(second.kind(), std::io::ErrorKind::AddrInUse);
         server.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn calendar_methods_round_trip_over_rpc() {
+        let dir = std::env::temp_dir().join(format!("mailcore-rpc-{}", uuid::Uuid::new_v4()));
+        let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("s.json"), "pw").unwrap();
+        let api = Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir.clone());
+        let call = |method: &str, params: serde_json::Value| {
+            let req: Request = serde_json::from_value(json!({"id": 1, "method": method, "params": params})).unwrap();
+            let api = &api;
+            async move { dispatch(api, req).await }
+        };
+        let created = call("event.create", json!({"title": "Lunch", "start": "2026-10-29T12:00", "tz": "America/Chicago"})).await.result.unwrap();
+        assert_eq!(created["start_utc"], "2026-10-29T17:00:00Z");
+        let id = created["id"].as_str().unwrap().to_string();
+        let range = call("calendar.range", json!({"from": "2026-10-29T00:00:00Z", "to": "2026-10-30T00:00:00Z"})).await.result.unwrap();
+        assert_eq!(range[0]["title"], "Lunch");
+        assert_eq!(range[0]["color"], "#7aa2f7");
+        let updated = call("event.update", json!({"id": id, "event": {"title": "Late lunch", "start": "2026-10-29T13:00", "tz": "America/Chicago"}})).await.result.unwrap();
+        assert_eq!(updated["title"], "Late lunch");
+        let cals = call("calendar.list", json!({})).await.result.unwrap();
+        assert_eq!(cals[0]["id"], "personal");
+        let bad = call("event.create", json!({"title": "", "start": "2026-10-29T13:00"})).await;
+        assert_eq!(bad.error.unwrap().code, -32602, "invalid input is a client error");
+        assert!(call("event.delete", json!({"id": id})).await.error.is_none());
+        assert!(call("event.get", json!({"id": id})).await.error.is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

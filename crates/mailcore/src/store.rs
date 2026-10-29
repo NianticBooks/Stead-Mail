@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, AuthKind, Provider, ServerConfig};
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE accounts (
@@ -227,6 +227,66 @@ CREATE TABLE calendar_events (
 CREATE UNIQUE INDEX calendar_events_by_proposal ON calendar_events(source_proposal_id) WHERE source_proposal_id IS NOT NULL;
 "#;
 
+/// The calendar proper: named calendars and the events in them. Events carry what two-way sync needs
+/// (remote id, etag, dirty flag, tombstone), so the sync phase adds no migration here. The minimal
+/// calendar_events table from the AI phase is folded into a default local calendar.
+const MIGRATION_V9: &str = r#"
+CREATE TABLE calendars (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    color      TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'local',
+    read_only  INTEGER NOT NULL DEFAULT 0,
+    visible    INTEGER NOT NULL DEFAULT 1,
+    account_id TEXT,
+    remote_id  TEXT,
+    sync_token TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+INSERT INTO calendars (id, name, color, kind) VALUES ('personal', 'Personal', '#7aa2f7', 'local');
+
+CREATE TABLE events (
+    id                 TEXT PRIMARY KEY,
+    calendar_id        TEXT NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
+    uid                TEXT NOT NULL,
+    title              TEXT NOT NULL,
+    description        TEXT,
+    location           TEXT,
+    start_utc          TEXT NOT NULL,
+    end_utc            TEXT NOT NULL,
+    all_day            INTEGER NOT NULL DEFAULT 0,
+    tz                 TEXT,
+    rrule              TEXT,
+    exdates            TEXT NOT NULL DEFAULT '[]',
+    status             TEXT NOT NULL DEFAULT 'confirmed',
+    organizer          TEXT,
+    attendees          TEXT NOT NULL DEFAULT '[]',
+    source_proposal_id INTEGER,
+    source_message_id  INTEGER,
+    sequence           INTEGER NOT NULL DEFAULT 0,
+    remote_id          TEXT,
+    etag               TEXT,
+    dirty              INTEGER NOT NULL DEFAULT 1,
+    deleted            INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE UNIQUE INDEX events_by_uid ON events(calendar_id, uid) WHERE deleted = 0;
+CREATE UNIQUE INDEX events_by_proposal ON events(source_proposal_id) WHERE source_proposal_id IS NOT NULL;
+CREATE INDEX events_by_start ON events(start_utc);
+
+INSERT INTO events (id, calendar_id, uid, title, location, start_utc, end_utc, all_day, tz, rrule, attendees, source_proposal_id, source_message_id, created_at)
+SELECT lower(hex(randomblob(16))), 'personal',
+       COALESCE(ics_uid, lower(hex(randomblob(12))) || '@mailcore'),
+       title, location, start_utc,
+       CASE WHEN end_utc IS NOT NULL AND end_utc > start_utc THEN end_utc
+            WHEN all_day = 1 THEN strftime('%Y-%m-%dT%H:%M:%SZ', start_utc, '+1 day')
+            ELSE strftime('%Y-%m-%dT%H:%M:%SZ', start_utc, '+1 hour') END,
+       all_day, tz, rrule, attendees, source_proposal_id, source_message_id, created_at
+FROM calendar_events;
+DROP TABLE calendar_events;
+"#;
+
 /// Triage can flag a message that tried to instruct an AI.
 const MIGRATION_V8: &str = "ALTER TABLE ai_triage ADD COLUMN suspicious INTEGER NOT NULL DEFAULT 0;";
 
@@ -321,22 +381,6 @@ pub struct EventProposal {
     pub proposal: crate::ai::events::NewProposal,
     /// pending | accepted | dismissed
     pub state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CalendarEvent {
-    pub id: i64,
-    pub title: String,
-    pub start_utc: String,
-    pub end_utc: Option<String>,
-    pub all_day: bool,
-    pub tz: Option<String>,
-    pub location: Option<String>,
-    pub attendees: Vec<String>,
-    pub rrule: Option<String>,
-    pub ics_uid: Option<String>,
-    pub source_proposal_id: Option<i64>,
-    pub source_message_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -534,7 +578,7 @@ pub fn fts_query(text: &str) -> Option<String> {
 }
 
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Store {
@@ -583,6 +627,9 @@ impl Store {
         }
         if version < 8 {
             tx.execute_batch(MIGRATION_V8)?;
+        }
+        if version < 9 {
+            tx.execute_batch(MIGRATION_V9)?;
         }
         if version < SCHEMA_VERSION {
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -1050,54 +1097,63 @@ impl Store {
         Ok(p)
     }
 
-    /// Accept a pending proposal: it becomes a calendar event, atomically. Cancellation notices
-    /// are information, not events to add.
-    pub fn accept_proposal(&mut self, id: i64) -> Result<CalendarEvent> {
+    /// Accept a pending proposal: it becomes an event in the default calendar, atomically.
+    /// Cancellation notices are information, not events to add. If the invitation is already on
+    /// the calendar (same UID), the proposal is marked accepted and the existing event is returned.
+    pub fn accept_proposal(&mut self, id: i64) -> Result<crate::calendar::Event> {
+        use crate::calendar::model::{rfc3339, parse_instant};
         let tx = self.conn.transaction()?;
-        let (state, method): (String, Option<String>) = tx
-            .query_row("SELECT state, method FROM event_proposals WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?
-            .ok_or_else(|| Error::Invalid(format!("no event proposal {id}")))?;
+        #[allow(clippy::type_complexity)]
+        let row: Option<(String, Option<String>, String, String, String, Option<String>, bool, Option<String>, Option<String>, String, Option<String>, Option<String>, i64)> = tx
+            .query_row(
+                "SELECT state, method, title, start_utc, COALESCE(end_utc, ''), location, all_day, tz, rrule, attendees, ics_uid, NULL, message_id FROM event_proposals WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get::<_, i64>(6)? != 0, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get::<_, Option<String>>(11)?, r.get(12)?)),
+            )
+            .optional()?;
+        let Some((state, method, title, start, end, location, all_day, tz, rrule, attendees, uid, organizer, message_id)) = row else {
+            return Err(Error::Invalid(format!("no event proposal {id}")));
+        };
         if state != "pending" {
             return Err(Error::Invalid(format!("this proposal is already {state}")));
         }
         if method.as_deref() == Some("CANCEL") {
             return Err(Error::Invalid("this is a cancellation notice, not an event to add".into()));
         }
-        tx.execute(
-            "INSERT INTO calendar_events (title, start_utc, end_utc, all_day, tz, location, attendees, rrule, ics_uid, source_proposal_id, source_message_id)
-             SELECT title, start_utc, end_utc, all_day, tz, location, attendees, rrule, ics_uid, id, message_id FROM event_proposals WHERE id = ?1",
-            [id],
-        )?;
-        let event_id = tx.last_insert_rowid();
+        let cal = crate::calendar::db::default_calendar_id(&tx)?;
+        let uid = uid.unwrap_or_else(|| format!("{}@mailcore", uuid::Uuid::new_v4()));
+        if let Some(existing) = crate::calendar::db::event_by_uid(&tx, &cal, &uid)? {
+            tx.execute("UPDATE event_proposals SET state = 'accepted' WHERE id = ?1", [id])?;
+            tx.commit()?;
+            return Ok(existing);
+        }
+        let start_t = parse_instant(&start)?;
+        let end_t = parse_instant(&end).ok().filter(|e| *e > start_t).unwrap_or(start_t + if all_day { chrono::Duration::days(1) } else { chrono::Duration::hours(1) });
+        let ev = crate::calendar::Event {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            calendar_id: cal,
+            uid,
+            title,
+            description: None,
+            location,
+            start_utc: rfc3339(start_t),
+            end_utc: rfc3339(end_t),
+            all_day,
+            tz,
+            rrule,
+            exdates: vec![],
+            status: "confirmed".into(),
+            organizer,
+            attendees: serde_json::from_str(&attendees).unwrap_or_default(),
+            source_message_id: Some(message_id),
+            sequence: 0,
+            updated_at: String::new(),
+        };
+        crate::calendar::db::put_event(&tx, &ev, Some(id))?;
         tx.execute("UPDATE event_proposals SET state = 'accepted' WHERE id = ?1", [id])?;
+        let saved = crate::calendar::db::event(&tx, &ev.id)?;
         tx.commit()?;
-        self.calendar_event(event_id)
-    }
-
-    fn calendar_event(&self, id: i64) -> Result<CalendarEvent> {
-        Ok(self.conn.query_row(
-            "SELECT id, title, start_utc, end_utc, all_day, tz, location, attendees, rrule, ics_uid, source_proposal_id, source_message_id FROM calendar_events WHERE id = ?1",
-            [id],
-            Self::row_to_event,
-        )?)
-    }
-
-    fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarEvent> {
-        let attendees: String = r.get(7)?;
-        Ok(CalendarEvent {
-            id: r.get(0)?, title: r.get(1)?, start_utc: r.get(2)?, end_utc: r.get(3)?, all_day: r.get::<_, i64>(4)? != 0, tz: r.get(5)?,
-            location: r.get(6)?, attendees: serde_json::from_str(&attendees).unwrap_or_default(), rrule: r.get(8)?, ics_uid: r.get(9)?,
-            source_proposal_id: r.get(10)?, source_message_id: r.get(11)?,
-        })
-    }
-
-    pub fn list_calendar_events(&self, limit: usize) -> Result<Vec<CalendarEvent>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, start_utc, end_utc, all_day, tz, location, attendees, rrule, ics_uid, source_proposal_id, source_message_id
-             FROM calendar_events ORDER BY start_utc LIMIT ?1",
-        )?;
-        Ok(stmt.query_map([limit as i64], Self::row_to_event)?.collect::<std::result::Result<_, _>>()?)
+        Ok(saved)
     }
 
     pub fn record_ai_call(&self, provider: &str, model: &str, task: &str, bytes_out: usize, bytes_in: usize, millis: u64, error: Option<&str>) -> Result<()> {
@@ -1521,5 +1577,35 @@ mod tests {
         assert_eq!(fts_query("hello wor").unwrap(), "\"hello\" \"wor\"*");
         assert_eq!(fts_query("  a\"b  ").unwrap(), "\"ab\"*");
         assert_eq!(fts_query("   "), None);
+    }
+
+    #[test]
+    fn migration_v9_folds_old_calendar_events_into_the_personal_calendar() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        for m in [MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4, MIGRATION_V5, MIGRATION_V6, MIGRATION_V7, MIGRATION_V8] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 8").unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events (title, start_utc, end_utc, all_day, tz, location, attendees, rrule, ics_uid, source_proposal_id, source_message_id) VALUES
+             ('Dinner', '2026-10-29T19:30:00Z', '2026-10-29T21:00:00Z', 0, 'America/Chicago', 'Chez Louis', '[\"a@example.com\"]', NULL, 'inv-1', NULL, NULL),
+             ('No end', '2026-10-30T15:00:00Z', NULL, 0, NULL, NULL, '[]', NULL, NULL, NULL, NULL),
+             ('Party', '2026-10-31T05:00:00Z', NULL, 1, 'America/Chicago', NULL, '[]', NULL, 'p-1', NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(s.calendars().unwrap().iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["personal"]);
+        assert!(s.conn.query_row("SELECT 1 FROM sqlite_master WHERE name = 'calendar_events'", [], |r| r.get::<_, i64>(0)).is_err(), "the old table is gone");
+        let evs = s.list_events(None, 10).unwrap();
+        assert_eq!(evs.len(), 3);
+        assert_eq!((evs[0].title.as_str(), evs[0].uid.as_str(), evs[0].end_utc.as_str(), evs[0].attendees.clone()), ("Dinner", "inv-1", "2026-10-29T21:00:00Z", vec!["a@example.com".to_string()]));
+        assert_eq!(evs[1].end_utc, "2026-10-30T16:00:00Z", "a missing end becomes an hour");
+        assert!(evs[1].uid.ends_with("@mailcore"), "a missing UID is generated");
+        assert_eq!(evs[2].end_utc, "2026-11-01T05:00:00Z", "an all-day event without an end lasts one day");
+        assert!(evs.iter().all(|e| e.calendar_id == "personal"));
     }
 }

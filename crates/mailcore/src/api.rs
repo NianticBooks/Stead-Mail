@@ -1674,7 +1674,7 @@ mod tests {
         // Nothing is on the calendar until the user accepts.
         assert!(api.calendar_events(10).unwrap().is_empty());
         let ev = api.ai_accept_proposal(dinner.proposals[0].id).unwrap();
-        assert_eq!((ev.title.as_str(), ev.start_utc.as_str(), ev.ics_uid.as_deref()), ("Dinner with the Smiths", "2026-10-29T19:30:00Z", Some("inv-1")));
+        assert_eq!((ev.title.as_str(), ev.start_utc.as_str(), ev.uid.as_str()), ("Dinner with the Smiths", "2026-10-29T19:30:00Z", "inv-1"));
         assert_eq!(api.calendar_events(10).unwrap().len(), 1);
         assert!(api.ai_accept_proposal(dinner.proposals[0].id).is_err(), "no double add");
         assert!(api.ai_dismiss_proposal(dinner.proposals[0].id).is_err(), "an accepted proposal cannot be dismissed");

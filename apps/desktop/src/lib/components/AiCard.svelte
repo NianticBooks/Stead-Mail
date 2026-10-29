@@ -2,9 +2,31 @@
   import { app } from "../state.svelte";
   import Icon from "./Icon.svelte";
   import { categoryLabel, formatEventTime, isPastEvent } from "../format";
+  import { api } from "../api";
+  import { cal } from "../calendar.svelte";
+  import type { Occurrence } from "../types";
 
   const t = $derived(app.detail?.triage ?? null);
   const shown = $derived(app.proposals.filter((p) => p.state !== "dismissed"));
+
+  // Tell the user when a suggested event overlaps something already on the calendar.
+  let overlaps = $state<Record<number, Occurrence[]>>({});
+  $effect(() => {
+    const open = shown.filter((p) => p.state === "pending" && p.method !== "CANCEL" && !isPastEvent(p) && !p.all_day);
+    let stale = false;
+    overlaps = {};
+    for (const p of open) {
+      api.calendarConflicts(p.start_utc, p.end_utc, undefined).then(
+        (c) => { if (!stale && c.length) overlaps = { ...overlaps, [p.id]: c }; },
+        () => {},
+      );
+    }
+    return () => (stale = true);
+  });
+
+  async function accept(id: number) {
+    if (await app.acceptProposal(id)) cal.markStale();
+  }
 </script>
 
 {#if app.aiEnabled && app.detail}
@@ -51,12 +73,15 @@
         </div>
         <div class="when">{formatEventTime(p)}{#if p.location} · {p.location}{/if}</div>
         {#if p.source === "ai" && p.quote}<blockquote>“{p.quote}”</blockquote>{/if}
+        {#if overlaps[p.id]?.length}
+          <div class="overlap" role="status"><Icon name="warning" size={13} /> Overlaps with {overlaps[p.id].slice(0, 2).map((o) => o.title).join(", ")}{overlaps[p.id].length > 2 ? ` and ${overlaps[p.id].length - 2} more` : ""}</div>
+        {/if}
         {#if p.attendees.length}<div class="muted small">With {p.attendees.slice(0, 4).join(", ")}{p.attendees.length > 4 ? ` +${p.attendees.length - 4}` : ""}</div>{/if}
         <div class="actions">
           {#if p.state === "accepted"}
             <span class="added"><Icon name="check" size={14} /> Added to your calendar</span>
           {:else}
-            {#if !cancelled && !past}<button class="btn sm primary" onclick={() => app.acceptProposal(p.id)}><Icon name="plus" size={14} /> Add to calendar</button>{/if}
+            {#if !cancelled && !past}<button class="btn sm primary" onclick={() => accept(p.id)}><Icon name="plus" size={14} /> Add to calendar</button>{/if}
             {#if past && !cancelled}<span class="muted small">This date has passed.</span>{/if}
             <button class="btn sm ghost" onclick={() => app.dismissProposal(p.id)}>Dismiss</button>
           {/if}
@@ -102,4 +127,5 @@
   .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .added { display: inline-flex; gap: 6px; align-items: center; color: var(--ok); font-size: 12.5px; }
   .small { font-size: 12.5px; }
+  .overlap { display: flex; gap: 6px; align-items: center; color: var(--warn); font-size: 12.5px; }
 </style>

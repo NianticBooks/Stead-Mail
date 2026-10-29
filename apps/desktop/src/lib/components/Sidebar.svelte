@@ -2,6 +2,7 @@
   import { app } from "../state.svelte";
   import Icon from "./Icon.svelte";
   import Avatar from "./Avatar.svelte";
+  import { cal } from "../calendar.svelte";
   import { isQuietFolder } from "../mailboxes";
 
   let showQuiet = $state(false);
@@ -13,11 +14,41 @@
 <aside class="rail" aria-label="Accounts and folders">
   <div class="top">
     <div class="brand"><Icon name="mail" size={18} /> Mailcore</div>
-    <button class="btn primary compose" onclick={() => app.openCompose()} title="Compose (c)">
-      <Icon name="compose" size={15} /> Compose
-    </button>
+    <div class="modes" role="tablist" aria-label="Section">
+      <button role="tab" aria-selected={app.view === "mail"} class:on={app.view === "mail"} onclick={() => (app.view = "mail")} title="Mail (g i)"><Icon name="mail" size={14} /> Mail</button>
+      <button role="tab" aria-selected={app.view === "calendar"} class:on={app.view === "calendar"} onclick={() => (app.view = "calendar")} title="Calendar (g c)"><Icon name="calendar" size={14} /> Calendar</button>
+    </div>
+    {#if app.view === "mail"}
+      <button class="btn primary compose" onclick={() => app.openCompose()} title="Compose (c)">
+        <Icon name="compose" size={15} /> Compose
+      </button>
+    {:else}
+      <button class="btn primary compose" onclick={() => cal.openNew()} title="New event (n)">
+        <Icon name="plus" size={15} /> New event
+      </button>
+    {/if}
   </div>
 
+  {#if app.view === "calendar"}
+    <nav class="scroll" aria-label="Calendars">
+      <div class="cal-head"><span>Calendars</span><button class="icon-btn" onclick={() => (cal.calendarDialog = "new")} aria-label="New calendar" title="New calendar"><Icon name="plus" size={14} /></button></div>
+      {#each cal.calendars as c (c.id)}
+        <div class="calrow">
+          <button class="vis" role="checkbox" aria-checked={c.visible} aria-label="Show {c.name}" onclick={() => cal.toggleVisible(c)}>
+            <span class="box" class:on={c.visible} style:--c={c.color}>{#if c.visible}<Icon name="check" size={11} />{/if}</span>
+          </button>
+          <span class="label" class:off={!c.visible}>{c.name}</span>
+          <button class="icon-btn small" onclick={() => (cal.calendarDialog = c)} aria-label="Edit {c.name}" title="Edit calendar"><Icon name="sliders" size={13} /></button>
+        </div>
+      {/each}
+      <label class="weekstart">Week starts on
+        <select class="input" value={cal.weekStart} onchange={(e) => cal.setWeekStart(Number(e.currentTarget.value) === 1 ? 1 : 0)}>
+          <option value={0}>Sunday</option>
+          <option value={1}>Monday</option>
+        </select>
+      </label>
+    </nav>
+  {:else}
   <nav class="scroll">
     {#each app.accounts as a (a.id)}
       <button class="account" class:active={a.id === app.accountId} onclick={() => a.id !== app.accountId && app.selectAccount(a.id)}>
@@ -56,6 +87,7 @@
       {/if}
     {/each}
   </nav>
+  {/if}
 
   <div class="foot">
     <button class="foot-btn" class:alert={app.failedOutbox > 0} onclick={() => (app.outboxOpen = true)} title="Outgoing mail">
@@ -72,6 +104,20 @@
   .top { padding: 14px 12px 10px; display: grid; gap: 12px; }
   .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; padding: 0 4px; letter-spacing: 0.01em; }
   .compose { width: 100%; padding: 8px 12px; }
+  .modes { display: grid; grid-template-columns: 1fr 1fr; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 2px; gap: 2px; }
+  .modes button { display: flex; gap: 6px; align-items: center; justify-content: center; border: 0; background: transparent; color: var(--fg-1); padding: 5px 6px; border-radius: 4px; cursor: pointer; }
+  .modes button:hover { color: var(--fg-0); }
+  .modes button.on { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
+  .cal-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 4px; color: var(--fg-2); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .calrow { display: flex; align-items: center; gap: 8px; padding: 3px 4px 3px 8px; border-radius: var(--radius-sm); }
+  .calrow:hover { background: var(--bg-2); }
+  .calrow .icon-btn.small { width: 22px; height: 22px; opacity: 0; }
+  .calrow:hover .icon-btn.small, .calrow .icon-btn.small:focus-visible { opacity: 1; }
+  .vis { display: grid; place-items: center; background: none; border: 0; padding: 2px; cursor: pointer; }
+  .box { display: grid; place-items: center; width: 16px; height: 16px; border-radius: 4px; border: 2px solid var(--c); color: #0b1020; }
+  .box.on { background: var(--c); }
+  .off { color: var(--fg-3); }
+  .weekstart { display: grid; gap: 4px; padding: 14px 8px 4px; color: var(--fg-2); font-size: 12px; }
   .scroll { flex: 1; overflow-y: auto; padding: 4px 8px 12px; min-height: 0; }
   .account {
     display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; padding: 8px; margin-top: 6px;

@@ -10,6 +10,10 @@
   import OutboxPanel from "$lib/components/OutboxPanel.svelte";
   import Shortcuts from "$lib/components/Shortcuts.svelte";
   import Toasts from "$lib/components/Toasts.svelte";
+  import CalendarView from "$lib/components/CalendarView.svelte";
+  import EventDialog from "$lib/components/EventDialog.svelte";
+  import CalendarDialog from "$lib/components/CalendarDialog.svelte";
+  import { cal } from "$lib/calendar.svelte";
 
   let list = $state<MessageList | null>(null);
   let chord = $state<string | null>(null);
@@ -19,7 +23,12 @@
     void app.init().catch((e) => app.toast("error", String(e)));
   });
 
-  const overlayOpen = $derived(app.compose !== null || app.settingsOpen || app.outboxOpen || app.helpOpen);
+  const overlayOpen = $derived(app.compose !== null || app.settingsOpen || app.outboxOpen || app.helpOpen || cal.overlayOpen);
+
+  // Entering the calendar loads what it shows; leaving costs nothing.
+  $effect(() => {
+    if (app.view === "calendar") void cal.open();
+  });
 
   function onkeydown(e: KeyboardEvent) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -39,7 +48,30 @@
       clearTimeout(chordTimer);
       if (e.key === "i") {
         e.preventDefault();
+        app.view = "mail";
         void app.selectMailbox("INBOX");
+      } else if (e.key === "c") {
+        e.preventDefault();
+        app.view = "calendar";
+      }
+      return;
+    }
+
+    if (app.view === "calendar") {
+      switch (e.key) {
+        case "t": e.preventDefault(); cal.today(); break;
+        case "n": e.preventDefault(); cal.openNew(); break;
+        case "[": case "ArrowLeft": e.preventDefault(); cal.step(-1); break;
+        case "]": case "ArrowRight": e.preventDefault(); cal.step(1); break;
+        case "m": cal.setView("month"); break;
+        case "w": cal.setView("week"); break;
+        case "d": cal.setView("day"); break;
+        case "a": cal.setView("agenda"); break;
+        case "?": app.helpOpen = true; break;
+        case "g":
+          chord = "g";
+          chordTimer = setTimeout(() => (chord = null), 1200);
+          break;
       }
       return;
     }
@@ -92,11 +124,18 @@
 <svelte:window {onkeydown} />
 <svelte:head><title>{app.currentMailbox?.unseen ? `(${app.currentMailbox.unseen}) ` : ""}Mailcore</title></svelte:head>
 
-<div class="shell" inert={overlayOpen}>
+<div class="shell" class:cal={app.view === "calendar"} inert={overlayOpen}>
   <Sidebar />
-  <MessageList bind:this={list} />
-  <Reader />
+  {#if app.view === "mail"}
+    <MessageList bind:this={list} />
+    <Reader />
+  {:else}
+    <CalendarView />
+  {/if}
 </div>
+
+{#if cal.dialog}<EventDialog />{/if}
+{#if cal.calendarDialog}<CalendarDialog />{/if}
 
 <Compose />
 <Settings />
@@ -105,5 +144,6 @@
 <Toasts />
 
 <style>
+  .shell.cal { grid-template-columns: 212px minmax(0, 1fr); }
   .shell { display: grid; grid-template-columns: 212px minmax(270px, 340px) minmax(0, 1fr); height: 100vh; }
 </style>

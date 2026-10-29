@@ -28,6 +28,11 @@ pub struct IcsEvent {
     pub attendees: Vec<String>,
     pub rrule: Option<String>,
     pub status: Option<String>,
+    /// Occurrences removed from a recurring event.
+    pub exdates: Vec<IcsTime>,
+    /// Set on an override of one occurrence of a recurring event (not supported by the calendar yet).
+    pub recurrence_id: Option<IcsTime>,
+    pub sequence: Option<i64>,
 }
 
 /// A concrete instant range, ready to store.
@@ -237,6 +242,15 @@ pub fn parse(text: &str) -> Vec<IcsEvent> {
                     "ATTENDEE" => e.attendees.push(mailto(&p.value)),
                     "RRULE" => e.rrule = Some(p.value.trim().to_string()),
                     "STATUS" => e.status = Some(p.value.trim().to_ascii_uppercase()),
+                    "SEQUENCE" => e.sequence = p.value.trim().parse().ok(),
+                    "RECURRENCE-ID" => e.recurrence_id = parse_time(&p),
+                    // One EXDATE line may list several instants separated by commas.
+                    "EXDATE" => {
+                        for part in p.value.split(',') {
+                            let single = Prop { name: p.name.clone(), params: p.params.clone(), value: part.to_string() };
+                            e.exdates.extend(parse_time(&single));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -261,7 +275,7 @@ pub fn local_to_utc(n: NaiveDateTime, tz: Tz) -> Option<DateTime<Utc>> {
 }
 
 impl IcsTime {
-    fn resolve(&self, default_tz: Tz) -> Option<(DateTime<Utc>, bool, Option<String>)> {
+    pub fn resolve(&self, default_tz: Tz) -> Option<(DateTime<Utc>, bool, Option<String>)> {
         match self {
             IcsTime::Utc(t) => Some((*t, false, Some("UTC".into()))),
             IcsTime::Zoned(n, tz) => to_utc(*n, *tz).map(|t| (t, false, Some(tz.name().to_string()))),
@@ -361,6 +375,20 @@ BEGIN:VEVENT\r\nDTSTART:20261105T090000Z\r\nSUMMARY:No end\r\nEND:VEVENT\r\nEND:
         assert!(parse("").is_empty());
         assert!(parse("complete nonsense\r\n::::\r\nBEGIN:VEVENT").is_empty(), "an unterminated event is dropped");
         assert!(parse(&"BEGIN:VEVENT\r\n".repeat(3)).is_empty());
+    }
+
+    #[test]
+    fn recurrence_exceptions_and_sequence_are_read() {
+        let ics = "BEGIN:VEVENT\r\nUID:r\r\nSEQUENCE:3\r\nDTSTART;TZID=America/Chicago:20261029T090000\r\nRRULE:FREQ=WEEKLY;BYDAY=TH\r\n\
+EXDATE;TZID=America/Chicago:20261105T090000,20261112T090000\r\nSUMMARY:Standup\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:r\r\nRECURRENCE-ID;TZID=America/Chicago:20261119T090000\r\nDTSTART;TZID=America/Chicago:20261119T100000\r\nSUMMARY:Standup (moved)\r\nEND:VEVENT";
+        let ev = parse(ics);
+        assert_eq!(ev.len(), 2);
+        assert_eq!((ev[0].sequence, ev[0].rrule.as_deref(), ev[0].exdates.len()), (Some(3), Some("FREQ=WEEKLY;BYDAY=TH"), 2));
+        assert!(ev[0].recurrence_id.is_none());
+        assert!(ev[1].recurrence_id.is_some(), "overrides are identified so the importer can skip or handle them");
+        let first = ev[0].exdates[0].resolve(Chicago).unwrap();
+        assert_eq!(first.0.to_rfc3339(), "2026-11-05T15:00:00+00:00", "9 AM CST");
     }
 
     #[test]

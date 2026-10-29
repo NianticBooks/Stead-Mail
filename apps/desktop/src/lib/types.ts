@@ -193,15 +193,69 @@ export interface EventProposal {
   state: "pending" | "accepted" | "dismissed";
 }
 
-export interface CalendarEvent {
-  id: number;
+export interface Calendar {
+  id: string;
+  name: string;
+  color: string;
+  kind: "local" | "google" | "caldav";
+  read_only: boolean;
+  visible: boolean;
+}
+
+export interface CalEvent {
+  id: string;
+  calendar_id: string;
+  uid: string;
   title: string;
+  description: string | null;
+  location: string | null;
   start_utc: string;
-  end_utc: string | null;
+  end_utc: string;
   all_day: boolean;
   tz: string | null;
-  location: string | null;
+  rrule: string | null;
+  exdates: string[];
+  status: "confirmed" | "tentative" | "cancelled";
+  organizer: string | null;
   attendees: string[];
+  sequence: number;
+}
+
+/** What the form sends to create or change an event. Times are local to `tz`. */
+export interface EventInput {
+  calendar_id?: string;
+  title: string;
+  description?: string;
+  location?: string;
+  start: string;
+  end?: string;
+  all_day: boolean;
+  tz?: string;
+  rrule?: string;
+  status?: string;
+  attendees: string[];
+}
+
+/** One appearance of an event in a window; a recurring event has many. */
+export interface Occurrence {
+  event_id: string;
+  calendar_id: string;
+  title: string;
+  location: string | null;
+  start_utc: string;
+  end_utc: string;
+  all_day: boolean;
+  tz: string | null;
+  recurring: boolean;
+  status: string;
+  color: string;
+  instance: string;
+}
+
+export interface ImportReport {
+  added: number;
+  updated: number;
+  skipped: string[];
 }
 
 export type ProviderKind = "local" | "cloud";

@@ -8,6 +8,7 @@ pub mod account;
 pub mod ai;
 pub mod api;
 pub mod body;
+pub mod calendar;
 pub mod caldav;
 pub mod error;
 pub mod google;

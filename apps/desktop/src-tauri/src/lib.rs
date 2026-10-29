@@ -96,6 +96,45 @@ fn download_dir(app: AppHandle) -> Result<String, String> {
     app.path().download_dir().map(|p| p.display().to_string()).map_err(|e| e.to_string())
 }
 
+const MAX_ICS_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Read a calendar file the user picked. Only .ics files up to 5 MB are read.
+#[tauri::command]
+fn read_ics(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    let ok = p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("ics"));
+    if !ok {
+        return Err("choose a calendar file ending in .ics".into());
+    }
+    let len = std::fs::metadata(p).map_err(|e| e.to_string())?.len();
+    if len > MAX_ICS_BYTES {
+        return Err("that file is too large to import".into());
+    }
+    std::fs::read_to_string(p).map_err(|e| format!("could not read the file as text: {e}"))
+}
+
+/// Save an exported calendar into the downloads folder under a safe, unused name.
+#[tauri::command]
+fn write_ics(app: AppHandle, name: String, text: String) -> Result<String, String> {
+    use std::io::Write;
+    let dir = app.path().download_dir().map_err(|e| e.to_string())?;
+    let stem: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { ' ' }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+    let stem = if stem.is_empty() { "calendar".to_string() } else { stem.chars().take(60).collect() };
+    for n in 0..1000 {
+        let file = if n == 0 { format!("{stem}.ics") } else { format!("{stem} ({n}).ics") };
+        let path = dir.join(file);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+                return Ok(path.display().to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("too many files with that name in the downloads folder".into())
+}
+
 #[derive(Serialize, Clone)]
 struct WatchError {
     account: String,
@@ -181,7 +220,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![diag, rpc, google_login, open_external, reveal_file, download_dir, restart_watchers])
+        .invoke_handler(tauri::generate_handler![diag, rpc, google_login, open_external, reveal_file, download_dir, read_ics, write_ics, restart_watchers])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

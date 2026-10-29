@@ -11,7 +11,7 @@ use super::triage::{self, Category, Triage};
 use super::{AiConfig, Provider};
 use crate::api::Api;
 use crate::error::{Error, Result};
-use crate::store::{AiCall, AiUsage, CalendarEvent, EventProposal, MessageDetail, MessageRow};
+use crate::store::{AiCall, AiUsage, EventProposal, MessageDetail, MessageRow};
 
 const SETTINGS_KEY: &str = "ai.config";
 const CLOUD_KEY: &str = "ai/anthropic_api_key";
@@ -367,7 +367,7 @@ impl Api {
         store.pending_proposals(account_id.as_deref(), limit)
     }
 
-    pub fn ai_accept_proposal(&self, id: i64) -> Result<CalendarEvent> {
+    pub fn ai_accept_proposal(&self, id: i64) -> Result<crate::calendar::Event> {
         self.store().accept_proposal(id)
     }
 
@@ -375,8 +375,8 @@ impl Api {
         self.store().dismiss_proposal(id)
     }
 
-    pub fn calendar_events(&self, limit: usize) -> Result<Vec<CalendarEvent>> {
-        self.store().list_calendar_events(limit)
+    pub fn calendar_events(&self, limit: usize) -> Result<Vec<crate::calendar::Event>> {
+        self.store().list_events(None, limit)
     }
 
     // ------------------------------------------------------------ evaluation

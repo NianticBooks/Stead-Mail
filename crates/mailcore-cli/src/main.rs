@@ -136,6 +136,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GoogleCmd,
     },
+    /// Your local calendar: list, add and remove events, import and export .ics files.
+    Cal {
+        #[command(subcommand)]
+        cmd: CalCmd,
+    },
     /// AI features: triage, event proposals, drafting, evaluation. Off until you enable them.
     Ai {
         #[command(subcommand)]
@@ -149,6 +154,73 @@ enum Cmd {
         /// Listen on this Unix socket path instead of stdio.
         #[arg(long, conflicts_with = "socket")]
         socket_path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CalCmd {
+    /// List calendars.
+    List,
+    /// Create a calendar.
+    New {
+        name: String,
+        #[arg(long, default_value = "#9ece6a")]
+        color: String,
+    },
+    /// Show upcoming occurrences (recurring events expanded).
+    Agenda {
+        /// Days to show, starting now (or --from).
+        #[arg(long, default_value_t = 14)]
+        days: i64,
+        /// Start of the window, RFC 3339 (default: now).
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Add an event. Times are local, like 2026-10-29T14:30, in --tz (default: your zone).
+    Add {
+        title: String,
+        #[arg(long)]
+        start: String,
+        #[arg(long)]
+        end: Option<String>,
+        #[arg(long)]
+        all_day: bool,
+        #[arg(long)]
+        tz: Option<String>,
+        /// Repeat rule, like FREQ=WEEKLY;BYDAY=TH
+        #[arg(long)]
+        repeat: Option<String>,
+        #[arg(long)]
+        location: Option<String>,
+        #[arg(long)]
+        calendar: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// Remove an event, or with --instance only that occurrence of a series.
+    Rm {
+        id: String,
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    /// Show events that overlap a time.
+    Conflicts {
+        start: String,
+        #[arg(long)]
+        end: Option<String>,
+    },
+    /// Import an .ics file into a calendar.
+    Import {
+        file: std::path::PathBuf,
+        #[arg(long, default_value = "personal")]
+        calendar: String,
+    },
+    /// Export a calendar as .ics (to a file, or to stdout).
+    Export {
+        #[arg(long, default_value = "personal")]
+        calendar: String,
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -573,6 +645,7 @@ async fn main() -> Result<()> {
             }),
             GoogleCmd::Logout { account } => out(cli.json, &api.google_logout(&account)?, |i| println!("removed {} and its stored tokens", i.email)),
         },
+        Cmd::Cal { cmd } => cal_command(&api, cmd, cli.json)?,
         Cmd::Ai { cmd } => ai_command(&api, cmd, cli.json).await?,
         Cmd::Serve { socket, socket_path } => {
             let path = socket_path.or_else(|| socket.then(mailcore::socket_path));
@@ -774,4 +847,75 @@ fn out<T: serde::Serialize>(json: bool, v: &T, human: impl FnOnce(&T)) {
 
 fn fmt_opt<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
+}
+
+fn cal_command(api: &Api, cmd: CalCmd, json: bool) -> anyhow::Result<()> {
+    use mailcore::calendar::EventInput;
+    match cmd {
+        CalCmd::List => okout(json, &api.calendars()?, |l| {
+            for c in l {
+                println!("{:<12} {}  {}{}{}", c.id, c.color, c.name, if c.visible { "" } else { "  (hidden)" }, if c.read_only { "  (read-only)" } else { "" });
+            }
+        }),
+        CalCmd::New { name, color } => okout(json, &api.calendar_create(&name, &color)?, |c| println!("created {} ({})", c.name, c.id)),
+        CalCmd::Agenda { days, from } => {
+            let from = match from {
+                Some(f) => f,
+                None => chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            };
+            let start = chrono::DateTime::parse_from_rfc3339(&from)?.with_timezone(&chrono::Utc);
+            let to = (start + chrono::Duration::days(days.clamp(1, 400))).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let tz = api.calendar_tz();
+            okout(json, &api.calendar_range(&from, &to, None)?, |l| {
+                if l.is_empty() {
+                    println!("nothing scheduled");
+                }
+                for o in l {
+                    let s = chrono::DateTime::parse_from_rfc3339(&o.start_utc).map(|t| t.with_timezone(&tz));
+                    let when = match (s, o.all_day) {
+                        (Ok(t), true) => format!("{}  all day   ", t.format("%a %b %d")),
+                        (Ok(t), false) => t.format("%a %b %d  %H:%M").to_string() + "   ",
+                        (Err(_), _) => o.start_utc.clone(),
+                    };
+                    println!("{when}{}{}{}", o.title, if o.recurring { "  (repeats)" } else { "" }, o.location.as_ref().map(|x| format!(" @ {x}")).unwrap_or_default());
+                }
+            })
+        }
+        CalCmd::Add { title, start, end, all_day, tz, repeat, location, calendar, notes } => {
+            let input = EventInput { calendar_id: calendar, title, description: notes, location, start, end, all_day, tz, rrule: repeat, ..Default::default() };
+            okout(json, &api.event_create(input)?, |e| println!("added {} ({}) at {}", e.title, e.id, e.start_utc))
+        }
+        CalCmd::Rm { id, instance } => okout(json, &api.event_delete(&id, instance.as_deref())?, |e| match e {
+            Some(e) => println!("removed that occurrence of {}", e.title),
+            None => println!("removed"),
+        }),
+        CalCmd::Conflicts { start, end } => okout(json, &api.calendar_conflicts(&start, end.as_deref(), None)?, |l| {
+            if l.is_empty() {
+                println!("free");
+            }
+            for o in l {
+                println!("{}  {}", o.start_utc, o.title);
+            }
+        }),
+        CalCmd::Import { file, calendar } => {
+            let text = std::fs::read_to_string(&file)?;
+            okout(json, &api.calendar_import(&calendar, &text)?, |r| {
+                println!("added {}, updated {}", r.added, r.updated);
+                for s in &r.skipped {
+                    println!("skipped: {s}");
+                }
+            })
+        }
+        CalCmd::Export { calendar, out } => {
+            let text = api.calendar_export(&calendar)?;
+            match out {
+                Some(p) => {
+                    std::fs::write(&p, text)?;
+                    println!("wrote {}", p.display());
+                }
+                None => print!("{text}"),
+            }
+            Ok(())
+        }
+    }
 }

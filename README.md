@@ -19,6 +19,37 @@ Service / Keychain with an encrypted-file fallback; hybrid AI (local Ollama for 
 triage, cloud for drafting) with 100% human-in-the-loop; Google Calendar REST + iCloud CalDAV
 two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
+## Phase 5 (local calendar) — what exists
+
+- **Calendars and events** live in SQLite (migration v9). A default local "Personal" calendar exists from the start;
+  the old accepted-proposal table is folded into it. Events carry what two-way sync needs (remote id, etag, dirty
+  flag, tombstone), so Phase 6 adds no migration to events.
+- **Time zones done properly.** An event keeps the IANA zone its wall clock belongs to and instants are stored in
+  UTC. "Every Thursday at 9 AM" stays 9 AM across Daylight Saving changes (tested across both transitions).
+  All-day events span whole local days with an exclusive end, so a three-day trip over a DST change is three days.
+- **Recurrence** uses the `rrule` crate: daily, weekly, monthly (including "second Tuesday"), yearly, COUNT, UNTIL,
+  INTERVAL. Expansion is bounded by the query window, so endless rules are cheap. One occurrence can be removed from
+  a series (an EXDATE); editing a series keeps those exceptions unless the start or rule changes.
+  Not yet: editing a single occurrence (RECURRENCE-ID overrides). Those are reported as skipped on import.
+- **iCalendar import and export** (`.ics`): folded lines, escaping, TZID zones (including Windows names), all-day
+  dates, EXDATE, SEQUENCE. Importing the same file again updates events by UID instead of duplicating them.
+  Files over 5 MB or 5000 events are refused; broken events are skipped with a reason, never fatal.
+- **Conflict warnings, never blocks.** Adding or accepting an event shows what it overlaps (all-day banners and
+  cancelled events do not count). The AI proposal card shows the same warning before you click Add.
+- **CLI:** `mailcore cal list | new | add | agenda | rm | conflicts | import | export`.
+  **RPC:** `calendar.list/create/update/delete/range/conflicts/export/import`, `event.get/create/update/delete`.
+- **GUI:** a Mail / Calendar switch in the sidebar. Month, week, day and agenda views; overlapping events sit side by
+  side; a live "now" line; create and edit dialog with repeat presets, time zone, guests and a live overlap warning;
+  per-calendar colour, visibility, rename, delete, import and export. Keys: `g c` / `g i` switch sections, `t` today,
+  `n` new event, `[` `]` or arrows step, `m w d a` pick the view.
+- Everything stays human-in-the-loop: nothing reaches the calendar except by an explicit click or command.
+- Verified: 148 Rust tests (recurrence across DST, ICS round trips, migration from a real v8 schema, RPC), 60
+  frontend tests run under four machine time zones, and the real app driven in a throwaway profile (all four
+  views, new-event overlap warning, save, series dialog, Escape, switching sections).
+- **Not verified / not done:** sync with Google Calendar and iCloud CalDAV (Phase 6: remote wins, conflicts logged
+  visibly), accepting a proposal through the live AI card, drag to move or resize, reminders, RECURRENCE-ID overrides,
+  macOS.
+
 ## Phase 4 (AI layer) — what exists
 
 Off until you turn it on (`mailcore ai enable`, or Settings → AI). Everything it produces is a proposal.
@@ -30,7 +61,7 @@ Off until you turn it on (`mailcore ai enable`, or Settings → AI). Everything 
   all-day dates and cancellations. Free-text dates are read by a model; each proposal must quote the sentence
   it came from, the quote is checked against the message, the date must be plausible, past or vague sentences
   are rejected, and weekday names are corrected in code because models get weekday arithmetic wrong.
-  Accepting a proposal puts it in the local calendar table (views and sync come in Phase 5).
+  Accepting a proposal adds it to the default local calendar (see Phase 5).
 - **Drafting**: `Draft with AI` in a reply. Local by default. A cloud draft shows the exact system prompt and
   message and only runs if its SHA-256 matches what you were shown.
 - **Local first**: Ollama (`qwen3:8b`, thinking off, JSON-schema output). Cloud (Claude Haiku for dates, Sonnet
