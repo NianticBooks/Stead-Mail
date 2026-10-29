@@ -65,6 +65,16 @@
   }
 
   let f = $state<Form>(makeForm());
+  /** Minutes before the start; empty means no reminder. Kept on this machine, never synced. */
+  let reminders = $state<number[]>([]);
+  const LEADS: [number, string][] = [[0, "At start"], [5, "5 min"], [10, "10 min"], [15, "15 min"], [30, "30 min"], [60, "1 hour"], [1440, "1 day"]];
+  function toggleLead(m: number) {
+    reminders = reminders.includes(m) ? reminders.filter((x) => x !== m) : [...reminders, m].sort((a, b) => a - b);
+  }
+  $effect(() => {
+    const id = eventId;
+    if (id) void api.eventReminders(id).then((r) => (reminders = r)).catch(() => {});
+  });
   let busy = $state(false);
   let error = $state<string | null>(null);
   let confirmDelete = $state(false);
@@ -141,7 +151,7 @@
     if (!canSave) return;
     busy = true;
     error = null;
-    error = await cal.saveEvent(input(), eventId);
+    error = await cal.saveEvent(input(), eventId, reminders);
     busy = false;
   }
 
@@ -233,6 +243,13 @@
         </div>
       {/if}
 
+      <div class="field">Remind me
+        <div class="leads">
+          {#each LEADS as [m, label] (m)}
+            <label class="check"><input type="checkbox" checked={reminders.includes(m)} onchange={() => toggleLead(m)} /> {label}</label>
+          {/each}
+        </div>
+      </div>
       <label class="field">Location <input class="input" bind:value={f.location} maxlength="300" autocomplete="off" /></label>
       <label class="field">Notes <textarea class="input" rows="3" bind:value={f.notes}></textarea></label>
       <label class="field">Guests <input class="input" bind:value={f.attendees} placeholder="name@example.com, …" autocomplete="off" /></label>
@@ -298,4 +315,5 @@
   .conflict div { display: grid; gap: 1px; }
   .conflict span { color: var(--fg-1); font-size: 12.5px; }
   footer { display: flex; gap: 8px; align-items: center; padding: 10px 16px; border-top: 1px solid var(--line); }
+  .leads { display: flex; flex-wrap: wrap; gap: 4px 14px; }
 </style>

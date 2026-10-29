@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, AuthKind, Provider, ServerConfig};
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE accounts (
@@ -290,6 +290,23 @@ DROP TABLE calendar_events;
 /// Two-way calendar sync: a log of what sync did to the user's data (conflicts above all), plus
 /// the calendar-side bookkeeping. `extra` keeps parts of a remote event we do not model (alarms,
 /// overridden occurrences) so that pushing an edit does not delete them from the server.
+/// Reminders belong to this machine: they are never pushed to Google or iCloud.
+/// `reminders_fired` remembers what already went off so a restart does not repeat it.
+const MIGRATION_V12: &str = r#"
+CREATE TABLE reminders (
+    event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    minutes  INTEGER NOT NULL CHECK (minutes >= 0),
+    PRIMARY KEY (event_id, minutes)
+);
+CREATE TABLE reminders_fired (
+    event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    instance TEXT NOT NULL,
+    minutes  INTEGER NOT NULL,
+    fired_at INTEGER NOT NULL,
+    PRIMARY KEY (event_id, instance, minutes)
+);
+"#;
+
 /// A sent message is also filed in the account's Sent folder (iCloud does not do it by itself).
 /// `sent_copy`: pending -> done | skipped | failed; the raw message is kept until it settles.
 const MIGRATION_V11: &str = r#"
@@ -680,6 +697,9 @@ impl Store {
         }
         if version < 11 {
             tx.execute_batch(MIGRATION_V11)?;
+        }
+        if version < 12 {
+            tx.execute_batch(MIGRATION_V12)?;
         }
         if version < SCHEMA_VERSION {
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;

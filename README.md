@@ -19,6 +19,19 @@ Service / Keychain with an encrypted-file fallback; hybrid AI (local Ollama for 
 triage, cloud for drafting) with 100% human-in-the-loop; Google Calendar REST + iCloud CalDAV
 two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
+## Phase 9 (calendar reminders) — what exists
+
+- **Reminders.** Any event can remind you 0 minutes to 7 days before it starts (several per event). They are kept on
+  this machine only: never pushed to Google or iCloud, and they work on read-only and synced calendars. In the event
+  dialog: "Remind me". CLI: `mailcore cal remind <id> 10 60` (`none` clears; no minutes shows them). RPC:
+  `event.reminders`, `event.set_reminders`, `reminders.poll`.
+- **Delivery.** The desktop app checks every 20 seconds, shows a desktop notification through `notify-send`
+  (mako, dunst and GNOME all serve it) and an in-window toast. Reminders only fire while the app is running.
+  Each occurrence of a repeating event reminds on its own; removed or cancelled ones stay quiet. A reminder that
+  came due while the app was closed still shows if the event has not started more than 5 minutes ago, and only
+  the closest lead time is shown. Nothing fires twice (schema v12 remembers what went off).
+- Not done: editing a single occurrence of a series, detecting read-only shared iCloud calendars up front.
+
 ## Phase 7 (mail completeness) — what exists
 
 - **Sent copy.** After a message is delivered, a copy is filed in the account's Sent folder with IMAP APPEND

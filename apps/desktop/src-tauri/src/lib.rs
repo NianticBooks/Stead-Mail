@@ -218,9 +218,36 @@ pub fn run() {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 }
             });
+            // Event reminders: show a desktop notification, and tell the window so it can toast too.
+            let remind_api = api.clone();
+            let remind_app = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    if let Ok(due) = remind_api.reminders_poll() {
+                        for r in due {
+                            notify_reminder(&r);
+                            let _ = remind_app.emit("calendar://reminder", r);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![diag, rpc, google_login, open_external, reveal_file, download_dir, read_ics, write_ics, restart_watchers])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Desktop notification through `notify-send` (libnotify), which mako, dunst and GNOME all serve.
+/// Quietly does nothing when it is missing; the in-window toast still shows.
+fn notify_reminder(r: &mailcore::calendar::remind::DueReminder) {
+    let when = if r.minutes == 0 { "now".to_string() } else if r.minutes % 1440 == 0 { format!("in {} day(s)", r.minutes / 1440) } else if r.minutes % 60 == 0 { format!("in {} h", r.minutes / 60) } else { format!("in {} min", r.minutes) };
+    let body = match &r.location {
+        Some(l) if !l.is_empty() => format!("Starts {when} · {l}"),
+        _ => format!("Starts {when}"),
+    };
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=Mailcore", "--icon=appointment-soon", "--urgency=normal", &r.title, &body])
+        .spawn();
 }

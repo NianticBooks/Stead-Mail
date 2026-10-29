@@ -439,6 +439,20 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
                 api.sync_log_clear()?;
                 to_json(&serde_json::json!({"ok": true}))
             }
+            "event.reminders" => {
+                let p: StrIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.event_reminders(&p.id)?)
+            }
+            "event.set_reminders" => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                    minutes: Vec<i64>,
+                }
+                let p: P = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.event_set_reminders(&p.id, &p.minutes)?)
+            }
+            "reminders.poll" => to_json(&api.reminders_poll()?),
             "event.get" => {
                 let p: StrIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.event_get(&p.id)?)
@@ -691,6 +705,9 @@ mod tests {
         assert!(call("calendar.sync", json!({"calendar": "personal"})).await.error.is_some(), "a local calendar cannot be synced");
         assert!(call("calendar.unlink", json!({"id": "personal"})).await.error.is_some());
         assert!(call("calendar.link", json!({"source": "google", "account_id": "x", "remote_id": "y"})).await.error.is_some());
+        assert_eq!(call("event.set_reminders", json!({"id": id, "minutes": [30, 5]})).await.result.unwrap(), json!([5, 30]));
+        assert_eq!(call("event.reminders", json!({"id": id})).await.result.unwrap(), json!([5, 30]));
+        assert!(call("reminders.poll", json!({})).await.error.is_none()); // result depends on the clock
         let range = call("calendar.range", json!({"from": "2026-10-29T00:00:00Z", "to": "2026-10-30T00:00:00Z"})).await.result.unwrap();
         assert_eq!(range[0]["title"], "Lunch");
         assert_eq!(range[0]["color"], "#7aa2f7");

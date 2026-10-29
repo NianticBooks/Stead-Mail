@@ -166,9 +166,10 @@ class CalendarState {
   }
 
   /** Create or change an event. Returns an error message for the dialog to show, or null on success. */
-  async saveEvent(input: EventInput, id?: string): Promise<string | null> {
+  async saveEvent(input: EventInput, id?: string, reminders?: number[]): Promise<string | null> {
     try {
       const ev = id ? await api.eventUpdate(id, input) : await api.eventCreate(input);
+      if (reminders) await api.eventSetReminders(ev.id, reminders);
       this.dialog = null;
       await this.refresh();
       app.toast("success", id ? `Saved “${ev.title}”` : `Added “${ev.title}”`);

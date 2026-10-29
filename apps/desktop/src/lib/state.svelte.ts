@@ -148,6 +148,10 @@ class App {
       this.toast("error", `Live updates stopped for ${name}: ${e.payload.error}`);
     });
     await listen("outbox://changed", () => void this.refreshOutbox());
+    await listen<{ title: string; minutes: number }>("calendar://reminder", (e) => {
+      const m = e.payload.minutes;
+      this.toast("info", `${e.payload.title} — ${m === 0 ? "starting now" : m >= 60 && m % 60 === 0 ? `in ${m / 60} h` : `in ${m} min`}`);
+    });
   }
 
   #onSynced(r: SyncReport) {

@@ -208,6 +208,12 @@ enum CalCmd {
         #[arg(long)]
         instance: Option<String>,
     },
+    /// Show an event's reminders, or set them (minutes before the start; `none` clears). Local only.
+    Remind {
+        id: String,
+        /// e.g. `10 60`, or `none`. Omit to just show them.
+        minutes: Vec<String>,
+    },
     /// Show events that overlap a time.
     Conflicts {
         start: String,
@@ -1014,6 +1020,17 @@ async fn cal_command(api: &Api, cmd: CalCmd, json: bool) -> anyhow::Result<()> {
             Some(e) => println!("removed that occurrence of {}", e.title),
             None => println!("removed"),
         }),
+        CalCmd::Remind { id, minutes } => {
+            let list = if minutes.is_empty() {
+                api.event_reminders(&id)?
+            } else if minutes.len() == 1 && minutes[0] == "none" {
+                api.event_set_reminders(&id, &[])?
+            } else {
+                let parsed: std::result::Result<Vec<i64>, _> = minutes.iter().map(|m| m.parse::<i64>()).collect();
+                api.event_set_reminders(&id, &parsed.map_err(|_| anyhow::anyhow!("minutes must be whole numbers, or `none`"))?)?
+            };
+            okout(json, &list, |l| if l.is_empty() { println!("no reminders") } else { println!("reminders: {} minute(s) before", l.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")) })
+        }
         CalCmd::Conflicts { start, end } => okout(json, &api.calendar_conflicts(&start, end.as_deref(), None)?, |l| {
             if l.is_empty() {
                 println!("free");

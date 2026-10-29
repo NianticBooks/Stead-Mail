@@ -384,7 +384,7 @@ impl Api {
 
     // ----- outbox -----
 
-    fn now() -> i64 {
+    pub(crate) fn now() -> i64 {
         crate::oauth::now_unix()
     }
 

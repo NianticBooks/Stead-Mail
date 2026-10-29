@@ -93,6 +93,8 @@ export const api = {
   eventCreate: (e: EventInput) => rpc<CalEvent>("event.create", { ...e }),
   eventUpdate: (id: string, event: EventInput) => rpc<CalEvent>("event.update", { id, event }),
   eventDelete: (id: string, instance?: string) => rpc<CalEvent | null>("event.delete", { id, instance }),
+  eventReminders: (id: string) => rpc<number[]>("event.reminders", { id }),
+  eventSetReminders: (id: string, minutes: number[]) => rpc<number[]>("event.set_reminders", { id, minutes }),
   eventGet: (id: string) => rpc<CalEvent>("event.get", { id }),
 
   googleConfigured: () => rpc<{ configured: boolean }>("google.configured"),

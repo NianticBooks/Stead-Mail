@@ -12,6 +12,7 @@ pub mod gcal;
 pub mod ical;
 pub mod model;
 pub mod recur;
+pub mod remind;
 pub mod sync;
 pub mod syncdb;
 #[cfg(test)]

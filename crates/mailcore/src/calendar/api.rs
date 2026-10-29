@@ -246,7 +246,7 @@ fn build_event(conn: &rusqlite::Connection, input: &EventInput, current: Option<
     })
 }
 
-fn occurrences_in(conn: &rusqlite::Connection, from: DateTime<Utc>, to: DateTime<Utc>, calendars: Option<&[String]>, exclude: Option<&str>) -> Result<Vec<Occurrence>> {
+pub(super) fn occurrences_in(conn: &rusqlite::Connection, from: DateTime<Utc>, to: DateTime<Utc>, calendars: Option<&[String]>, exclude: Option<&str>) -> Result<Vec<Occurrence>> {
     if to <= from {
         return Err(Error::Invalid("the range must end after it starts".into()));
     }
