@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, AuthKind, Provider, ServerConfig};
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE accounts (
@@ -290,6 +290,23 @@ DROP TABLE calendar_events;
 /// Two-way calendar sync: a log of what sync did to the user's data (conflicts above all), plus
 /// the calendar-side bookkeeping. `extra` keeps parts of a remote event we do not model (alarms,
 /// overridden occurrences) so that pushing an edit does not delete them from the server.
+/// A sent message is also filed in the account's Sent folder (iCloud does not do it by itself).
+/// `sent_copy`: pending -> done | skipped | failed; the raw message is kept until it settles.
+const MIGRATION_V11: &str = r#"
+ALTER TABLE outbox ADD COLUMN sent_copy TEXT NOT NULL DEFAULT 'skipped';
+ALTER TABLE outbox ADD COLUMN copy_error TEXT;
+-- NULL = never read; '' = read, no Cc. Reply-all needs it.
+ALTER TABLE messages ADD COLUMN cc_addrs TEXT;
+-- Unsent messages, kept on this machine. `body` and the lists are what the compose window held.
+CREATE TABLE drafts (
+    id          TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    data        TEXT NOT NULL,
+    subject     TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+"#;
+
 const MIGRATION_V10: &str = r#"
 CREATE TABLE sync_log (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,6 +374,8 @@ pub struct MessageHeader {
     pub from_name: Option<String>,
     pub from_addr: Option<String>,
     pub to_addrs: Option<String>,
+    /// Cc header; `Some("")` when the header was read and is absent.
+    pub cc_addrs: Option<String>,
     /// RFC 3339 from the Date header.
     pub date: Option<String>,
     /// RFC 3339 from IMAP INTERNALDATE.
@@ -484,6 +503,9 @@ pub struct OutboxItem {
     pub last_error: Option<String>,
     pub created_at: String,
     pub sent_at: Option<String>,
+    /// pending | done | skipped | failed: whether the copy in the Sent folder is filed.
+    pub sent_copy: String,
+    pub copy_error: Option<String>,
 }
 
 pub struct NewOutbox<'a> {
@@ -496,7 +518,7 @@ pub struct NewOutbox<'a> {
     pub now: i64,
 }
 
-const OUTBOX_COLS: &str = "id, account_id, message_id, from_addr, rcpts, subject, size, state, attempts, next_attempt_at, last_error, created_at, sent_at";
+const OUTBOX_COLS: &str = "id, account_id, message_id, from_addr, rcpts, subject, size, state, attempts, next_attempt_at, last_error, created_at, sent_at, sent_copy, copy_error";
 
 fn row_to_outbox(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxItem> {
     let rcpts: String = r.get(4)?;
@@ -514,6 +536,8 @@ fn row_to_outbox(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxItem> {
         last_error: r.get(10)?,
         created_at: r.get(11)?,
         sent_at: r.get(12)?,
+        sent_copy: r.get(13)?,
+        copy_error: r.get(14)?,
     })
 }
 
@@ -555,6 +579,7 @@ fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
             internal_date: r.get(11)?,
             size: r.get(12)?,
             flags: r.get(13)?,
+            cc_addrs: None,
         },
         thread_id: r.get(14)?,
         preview: r.get(15)?,
@@ -652,6 +677,9 @@ impl Store {
         }
         if version < 10 {
             tx.execute_batch(MIGRATION_V10)?;
+        }
+        if version < 11 {
+            tx.execute_batch(MIGRATION_V11)?;
         }
         if version < SCHEMA_VERSION {
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -787,6 +815,44 @@ impl Store {
             .ok_or_else(|| Error::MailboxNotFound(name.to_string()))
     }
 
+    // ----- drafts -----
+
+    /// Insert or replace a draft. `data` is the JSON the API layer owns; the store only indexes it.
+    pub fn draft_put(&self, id: &str, account_id: &str, subject: &str, data: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO drafts (id, account_id, data, subject) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(id) DO UPDATE SET account_id=?2, data=?3, subject=?4, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            params![id, account_id, data, subject],
+        )?;
+        Ok(())
+    }
+
+    /// (id, account_id, data, updated_at), newest first.
+    pub fn draft_list(&self) -> Result<Vec<(String, String, String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT id, account_id, data, updated_at FROM drafts ORDER BY updated_at DESC, rowid DESC")?;
+        Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn draft_get(&self, id: &str) -> Result<(String, String, String, String)> {
+        self.conn
+            .query_row("SELECT id, account_id, data, updated_at FROM drafts WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|_| Error::Invalid(format!("no draft '{id}'")))
+    }
+
+    pub fn draft_delete(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM drafts WHERE id=?1", [id])? == 1)
+    }
+
+    /// The stored Cc header of a cached message (`None` = not captured yet).
+    pub fn message_cc(&self, mailbox_id: i64, uid: u32) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT cc_addrs FROM messages WHERE mailbox_id=?1 AND uid=?2", params![mailbox_id, uid], |r| r.get(0))?)
+    }
+
+    pub fn set_message_cc(&self, mailbox_id: i64, uid: u32, cc: &str) -> Result<()> {
+        self.conn.execute("UPDATE messages SET cc_addrs=?3 WHERE mailbox_id=?1 AND uid=?2", params![mailbox_id, uid, cc])?;
+        Ok(())
+    }
+
     /// Drop every cached message in a mailbox. Required when UIDVALIDITY changes.
     pub fn clear_mailbox_messages(&self, mailbox_id: i64) -> Result<usize> {
         Ok(self.conn.execute("DELETE FROM messages WHERE mailbox_id = ?1", [mailbox_id])?)
@@ -843,15 +909,15 @@ impl Store {
         {
             let mut insert = tx.prepare(
                 "INSERT INTO messages (account_id, mailbox_id, uid, message_id, in_reply_to, references_hdr, subject,
-                                       from_name, from_addr, to_addrs, date, internal_date, size, flags, thread_id)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                                       from_name, from_addr, to_addrs, date, internal_date, size, flags, thread_id, cc_addrs)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
                  ON CONFLICT(mailbox_id, uid) DO NOTHING",
             )?;
             for h in new {
                 let thread = thread_for(&tx, account_id, mailbox_id, h)?;
                 let n = insert.execute(params![
                     account_id, mailbox_id, h.uid, h.message_id, h.in_reply_to, h.references, h.subject, h.from_name,
-                    h.from_addr, h.to_addrs, h.date, h.internal_date, h.size, h.flags, thread,
+                    h.from_addr, h.to_addrs, h.date, h.internal_date, h.size, h.flags, thread, h.cc_addrs,
                 ])?;
                 counts.inserted += n;
                 // Messages that used this one as a virtual thread root join its real thread.
@@ -1257,13 +1323,31 @@ impl Store {
     }
 
     /// The bytes are no longer needed once the server has accepted the message.
-    pub fn outbox_mark_sent(&self, id: &str) -> Result<()> {
+    pub fn outbox_mark_sent(&self, id: &str, keep_copy: bool) -> Result<()> {
         self.conn.execute(
-            "UPDATE outbox SET state='sent', attempts=attempts+1, raw=x'', locked_at=NULL, last_error=NULL,
-                    sent_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
-            [id],
+            "UPDATE outbox SET state='sent', attempts=attempts+1, locked_at=NULL, last_error=NULL,
+                    sent_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), sent_copy=?2,
+                    raw=CASE WHEN ?2='pending' THEN raw ELSE x'' END WHERE id=?1",
+            params![id, if keep_copy { "pending" } else { "skipped" }],
         )?;
         Ok(())
+    }
+
+    /// Record how filing the Sent copy went; the raw bytes are only dropped once it settles.
+    pub fn outbox_set_copy(&self, id: &str, state: &str, error: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbox SET sent_copy=?2, copy_error=?3, raw=CASE WHEN ?2='failed' THEN raw ELSE x'' END WHERE id=?1",
+            params![id, state, error],
+        )?;
+        Ok(())
+    }
+
+    /// Sent messages whose Sent-folder copy still has to be filed (never filed, or failed before).
+    pub fn outbox_copy_due(&self) -> Result<Vec<OutboxItem>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {OUTBOX_COLS} FROM outbox WHERE state='sent' AND sent_copy IN ('pending','failed') AND length(raw) > 0 ORDER BY created_at"
+        ))?;
+        Ok(stmt.query_map([], row_to_outbox)?.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn outbox_mark_retry(&self, id: &str, next_attempt_at: i64, error: &str) -> Result<()> {
@@ -1583,7 +1667,7 @@ mod tests {
 
         // Success drops the bytes but keeps the record.
         s.outbox_lock(&it.id, 500).unwrap();
-        s.outbox_mark_sent(&it.id).unwrap();
+        s.outbox_mark_sent(&it.id, false).unwrap();
         let r = s.outbox_get(&it.id).unwrap();
         assert_eq!((r.state.as_str(), r.attempts), ("sent", 1));
         assert!(r.sent_at.is_some() && r.last_error.is_none());

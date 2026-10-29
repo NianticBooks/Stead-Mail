@@ -8,6 +8,7 @@
   import Compose from "$lib/components/Compose.svelte";
   import Settings from "$lib/components/Settings.svelte";
   import OutboxPanel from "$lib/components/OutboxPanel.svelte";
+  import DraftsPanel from "$lib/components/DraftsPanel.svelte";
   import Shortcuts from "$lib/components/Shortcuts.svelte";
   import Toasts from "$lib/components/Toasts.svelte";
   import CalendarView from "$lib/components/CalendarView.svelte";
@@ -25,7 +26,7 @@
     void app.init().catch((e) => app.toast("error", String(e)));
   });
 
-  const overlayOpen = $derived(app.compose !== null || app.settingsOpen || app.outboxOpen || app.helpOpen || cal.overlayOpen);
+  const overlayOpen = $derived(app.compose !== null || app.settingsOpen || app.outboxOpen || app.draftsOpen || app.helpOpen || cal.overlayOpen);
 
   // Entering the calendar loads what it shows; leaving costs nothing.
   $effect(() => {
@@ -39,6 +40,7 @@
     if (e.key === "Escape") {
       if (app.helpOpen) return void (app.helpOpen = false);
       if (app.outboxOpen) return void (app.outboxOpen = false);
+      if (app.draftsOpen) return void (app.draftsOpen = false);
       if (app.settingsOpen && app.accounts.length > 0) return void (app.settingsOpen = false);
     }
     const t = e.target as HTMLElement | null;
@@ -100,6 +102,12 @@
           app.reply();
         }
         break;
+      case "R":
+        if (app.detail) {
+          e.preventDefault();
+          void app.replyAll();
+        }
+        break;
       case "u":
         if (app.detail) void app.setSeen(app.detail.uid, isUnread(app.detail));
         break;
@@ -145,6 +153,7 @@
 <Compose />
 <Settings />
 <OutboxPanel />
+<DraftsPanel />
 <Shortcuts />
 <Toasts />
 

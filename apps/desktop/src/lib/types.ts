@@ -9,6 +9,21 @@ export interface ServerConfig {
   username: string;
 }
 
+export interface Draft {
+  id: string;
+  account: string;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  subject: string;
+  body: string;
+  in_reply_to?: string | null;
+  references: string[];
+  attachments: string[];
+  reply_to?: [string, number] | null;
+  updated_at: string;
+}
+
 export interface Account {
   id: string;
   name: string;

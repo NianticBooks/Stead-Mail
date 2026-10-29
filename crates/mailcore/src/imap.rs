@@ -102,6 +102,13 @@ pub async fn fetch_recent_headers<T: ImapStream>(
     Ok((state, headers))
 }
 
+/// File a finished message in `mailbox` (the Sent copy, or a draft). `flags` like `\\Seen` or `\\Seen \\Draft`.
+pub async fn append<T: ImapStream>(session: &mut Session<T>, mailbox: &str, flags: &str, raw: &[u8]) -> Result<()> {
+    let flags = format!("({flags})");
+    session.append(mailbox, Some(flags.as_str()), None, raw).await?;
+    Ok(())
+}
+
 pub async fn logout<T: ImapStream>(mut session: Session<T>) -> Result<()> {
     session.logout().await?;
     Ok(())
@@ -157,18 +164,19 @@ pub fn parse_header_fields(raw: &[u8], h: &mut MessageHeader) {
         h.from_name = addr.name().map(|s| s.to_string());
         h.from_addr = addr.address().map(|s| s.to_string());
     }
-    if let Some(to) = msg.to() {
-        let list: Vec<String> = to
+    let fmt = |a: Option<mail_parser::AddressList<'_>>| -> Option<String> {
+        let list: Vec<String> = a?
             .mailboxes()
             .filter_map(|a| a.address().map(|addr| match a.name() {
                 Some(n) => format!("{n} <{addr}>"),
                 None => addr.to_string(),
             }))
             .collect();
-        if !list.is_empty() {
-            h.to_addrs = Some(list.join(", "));
-        }
-    }
+        Some(list.join(", ")).filter(|s| !s.is_empty())
+    };
+    h.to_addrs = fmt(msg.to());
+    // Empty (not NULL) records that the header was read and there is no Cc.
+    h.cc_addrs = Some(fmt(msg.cc()).unwrap_or_default());
     h.date = msg.date().map(|d| d.to_rfc3339());
     h.message_id = msg.message_id().map(|s| s.to_string());
     h.in_reply_to = msg.in_reply_to().and_then(|l| l.first()).map(|s| s.to_string());
@@ -294,6 +302,8 @@ pub(crate) mod fake_server {
         pub extra_list: Vec<String>,
         /// Every command line received, for assertions about what the client asked for.
         pub log: Vec<String>,
+        /// Messages filed with APPEND: (mailbox, flags, raw).
+        pub appended: Vec<(String, String, String)>,
     }
 
     impl FakeState {
@@ -308,6 +318,7 @@ pub(crate) mod fake_server {
                 push_on_idle: false,
                 extra_list: Vec::new(),
                 log: Vec::new(),
+                appended: Vec::new(),
             }
         }
 
@@ -447,6 +458,18 @@ pub(crate) mod fake_server {
                                     m.flags = cur.join(" ");
                                 }
                                 format!("{tag} OK STORE completed\r\n")
+                            }
+                            "APPEND" => {
+                                // args: `"Sent Messages" (\\Seen) {123}`; send the continuation, read the literal.
+                                let size: usize = args.rsplit('{').next().and_then(|x| x.trim_end_matches('}').parse().ok()).unwrap_or(0);
+                                let mailbox = args.split('"').nth(1).unwrap_or("").to_string();
+                                let flags = args.split('(').nth(1).and_then(|x| x.split(')').next()).unwrap_or("").to_string();
+                                let _ = w.write_all(b"+ go ahead\r\n").await;
+                                let mut buf = vec![0u8; size];
+                                let _ = tokio::io::AsyncReadExt::read_exact(lines.get_mut(), &mut buf).await;
+                                let _ = lines.next_line().await; // the CRLF that ends the command
+                                state.lock().unwrap().appended.push((mailbox, flags, String::from_utf8_lossy(&buf).into_owned()));
+                                format!("{tag} OK [APPENDUID 42 2000] APPEND completed\r\n")
                             }
                             "STATUS" => {
                                 let st = state.lock().unwrap();

@@ -9,6 +9,7 @@
     { keys: [["k"], ["↑"]], what: "Previous message" },
     { keys: [["c"]], what: "Compose" },
     { keys: [["r"]], what: "Reply" },
+    { keys: [["Shift", "R"]], what: "Reply to everyone" },
     { keys: [["u"]], what: "Mark read / unread" },
     { keys: [["s"]], what: "Star / unstar" },
     { keys: [["/"]], what: "Search" },

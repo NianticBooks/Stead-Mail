@@ -70,6 +70,77 @@ pub struct ConnectionReport {
     pub smtp_error: Option<String>,
 }
 
+/// A message being written. Saved on this machine only; `id` is empty until first saved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Draft {
+    #[serde(default)]
+    pub id: String,
+    pub account: String,
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    /// The message being answered, so AI drafting still works after a reopen: (mailbox, uid).
+    #[serde(default)]
+    pub reply_to: Option<(String, u32)>,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyAll {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+}
+
+/// Bare addresses from a stored header value such as `Doe, John <j@x.com>, kim@x.com`.
+fn bare_addresses(list: &str) -> Vec<String> {
+    list.split(',')
+        .filter_map(|piece| {
+            let piece = piece.trim();
+            match (piece.rfind('<'), piece.rfind('>')) {
+                (Some(a), Some(b)) if a < b => Some(piece[a + 1..b].trim().to_string()),
+                _ if piece.contains('@') => Some(piece.to_string()),
+                _ => None, // the name half of "Doe, John <j@x.com>"
+            }
+        })
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
+fn reply_all_recipients(own: &str, from: Option<&str>, to: Option<&str>, cc: &str) -> ReplyAll {
+    let mine = |a: &str| a.eq_ignore_ascii_case(own);
+    let (first, rest): (Vec<String>, Vec<String>) = match from {
+        // Replying to your own message continues the conversation with the people you wrote to.
+        Some(f) if mine(f) => (to.map(bare_addresses).unwrap_or_default(), Vec::new()),
+        f => (f.map(|f| vec![f.to_string()]).unwrap_or_default(), to.map(bare_addresses).unwrap_or_default()),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut take = |list: Vec<String>| -> Vec<String> {
+        list.into_iter().filter(|a| !mine(a) && seen.insert(a.to_ascii_lowercase())).collect()
+    };
+    let to_out = take(first);
+    let cc_out = take(rest.into_iter().chain(bare_addresses(cc)).collect());
+    ReplyAll { to: to_out, cc: cc_out }
+}
+
+pub(crate) enum ImapAny {
+    Tls(Box<imap::TlsSession>),
+    Plain(async_imap::Session<tokio::net::TcpStream>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SendRequest {
     pub account: String,
@@ -382,6 +453,13 @@ impl Api {
             store.outbox_due(now, None)?
         };
         let mut report = FlushReport::default();
+        let copies = self.store().outbox_copy_due()?;
+        for item in copies {
+            let account = self.store().find_account(&item.account_id);
+            if let Some((account, password)) = account.ok().and_then(|a| self.password_for(&a).ok().map(|p| (a, p))) {
+                let _ = self.file_sent_copy(&item.id, &account, &password).await;
+            }
+        }
         for item in due {
             let account = match self.store().find_account(&item.account_id) {
                 Ok(a) => a,
@@ -425,7 +503,7 @@ impl Api {
         {
             let store = self.store();
             match result {
-                Ok(()) => store.outbox_mark_sent(&item.id)?,
+                Ok(()) => store.outbox_mark_sent(&item.id, Self::wants_sent_copy(account))?,
                 Err(Error::SmtpTransient(msg)) => {
                     let attempt = item.attempts + 1;
                     if attempt >= OUTBOX_MAX_ATTEMPTS {
@@ -437,7 +515,67 @@ impl Api {
                 Err(e) => store.outbox_mark_failed(&item.id, &e.to_string())?,
             }
         }
+        // A failed copy is recorded on the item and retried later; it must not fail the send.
+        let _ = self.file_sent_copy(&item.id, account, password).await;
         self.store().outbox_get(&item.id)
+    }
+
+    /// Gmail files its own copy of anything sent through its SMTP server; filing another would duplicate it.
+    fn wants_sent_copy(account: &Account) -> bool {
+        account.provider != Provider::Gmail
+    }
+
+    /// The account's folder for a role (`sent`, `drafts`): by special-use flag, then by common names.
+    pub(crate) fn special_folder(&self, account_id: &str, role: &str) -> Result<Option<String>> {
+        let boxes = self.store().list_mailboxes(account_id)?;
+        let names: &[&str] = match role {
+            "sent" => &["sent", "sent messages", "sent items", "inbox.sent"],
+            _ => &["drafts", "draft", "inbox.drafts"],
+        };
+        let by_flag = boxes.iter().find(|m| m.attributes.to_ascii_lowercase().split(|c: char| !c.is_alphanumeric()).any(|t| t == role || (role == "drafts" && t == "drafts")));
+        let found = by_flag.or_else(|| {
+            boxes.iter().find(|m| {
+                let leaf = m.name.rsplit(m.delimiter.as_deref().unwrap_or("/")).next().unwrap_or(&m.name).to_ascii_lowercase();
+                names.contains(&leaf.as_str())
+            })
+        });
+        Ok(found.map(|m| m.name.clone()))
+    }
+
+    async fn imap_session(&self, account: &Account, password: &str) -> Result<ImapAny> {
+        if self.smtp_transport == smtp::Transport::Plain {
+            let c = imap::connect_plain(&account.imap.host, account.imap.port).await?;
+            Ok(ImapAny::Plain(imap::login(c, &account.imap.username, password).await?))
+        } else {
+            let c = imap::connect_tls(&account.imap.host, account.imap.port).await?;
+            Ok(ImapAny::Tls(Box::new(imap::login(c, &account.imap.username, password).await?)))
+        }
+    }
+
+    /// File the Sent copy of a delivered message. Delivery already succeeded, so a failure here is
+    /// recorded on the item (and retried by `outbox_flush`) rather than returned as a send error.
+    async fn file_sent_copy(&self, id: &str, account: &Account, password: &str) -> Result<()> {
+        let item = self.store().outbox_get(id)?;
+        if item.state != "sent" || !matches!(item.sent_copy.as_str(), "pending" | "failed") {
+            return Ok(());
+        }
+        let raw = self.store().outbox_raw(id)?;
+        let result: Result<()> = async {
+            let folder = self
+                .special_folder(&account.id, "sent")?
+                .ok_or_else(|| Error::Invalid("no Sent folder known for this account yet; sync it once".into()))?;
+            match self.imap_session(account, password).await? {
+                ImapAny::Tls(mut s) => { imap::append(&mut *s, &folder, "\\Seen", &raw).await?; let _ = imap::logout(*s).await; }
+                ImapAny::Plain(mut s) => { imap::append(&mut s, &folder, "\\Seen", &raw).await?; let _ = imap::logout(s).await; }
+            }
+            Ok(())
+        }
+        .await;
+        match &result {
+            Ok(()) => self.store().outbox_set_copy(id, "done", None)?,
+            Err(e) => self.store().outbox_set_copy(id, "failed", Some(&e.to_string()))?,
+        }
+        result
     }
 
     pub fn outbox_list(&self, account: Option<&str>, include_done: bool, limit: usize) -> Result<Vec<OutboxItem>> {
@@ -794,6 +932,82 @@ impl Api {
         store.find_message(mb.id, uid)
     }
 
+    // ---- drafts (local only) ----
+
+    /// Save or update a draft. An empty `id` creates one. Recipients and body are not validated:
+    /// a draft is allowed to be half written.
+    pub fn draft_save(&self, mut d: Draft) -> Result<Draft> {
+        let account = self.store().find_account(&d.account)?;
+        if d.id.is_empty() {
+            d.id = uuid::Uuid::new_v4().to_string();
+        }
+        let store = self.store();
+        store.draft_put(&d.id, &account.id, &d.subject, &serde_json::to_string(&d).map_err(|e| Error::Other(e.to_string()))?)?;
+        let (_, _, _, updated) = store.draft_get(&d.id)?;
+        d.updated_at = updated;
+        Ok(d)
+    }
+
+    pub fn draft_list(&self) -> Result<Vec<Draft>> {
+        let store = self.store();
+        store.draft_list()?.into_iter().map(|row| Self::draft_from_row(&store, row)).collect()
+    }
+
+    pub fn draft_get(&self, id: &str) -> Result<Draft> {
+        let store = self.store();
+        let row = store.draft_get(id)?;
+        Self::draft_from_row(&store, row)
+    }
+
+    pub fn draft_delete(&self, id: &str) -> Result<()> {
+        if !self.store().draft_delete(id)? {
+            return Err(Error::Invalid(format!("no draft '{id}'")));
+        }
+        Ok(())
+    }
+
+    fn draft_from_row(store: &Store, (id, account_id, data, updated_at): (String, String, String, String)) -> Result<Draft> {
+        let mut d: Draft = serde_json::from_str(&data).map_err(|e| Error::Other(e.to_string()))?;
+        d.id = id;
+        d.updated_at = updated_at;
+        // The account may have been renamed since: always report its current name.
+        if let Ok(a) = store.find_account(&account_id) {
+            d.account = a.name;
+        }
+        Ok(d)
+    }
+
+    /// Who a reply-all goes to: the sender and every other To/Cc recipient, minus this account.
+    /// When the message is one you sent, the recipients are the original To/Cc instead.
+    pub async fn reply_all(&self, key: &str, mailbox: &str, uid: u32) -> Result<ReplyAll> {
+        let account = self.store().find_account(key)?;
+        let (mb_id, row) = {
+            let store = self.store();
+            let mb = store.find_mailbox(&account.id, mailbox)?;
+            (mb.id, store.find_message(mb.id, uid)?)
+        };
+        let known = self.store().message_cc(mb_id, uid)?;
+        let cc = match known {
+            Some(cc) => cc,
+            None => {
+                // Synced before Cc was recorded: read it from the message itself, once.
+                let password = self.password_for(&account)?;
+                let client = imap::connect_tls(&account.imap.host, account.imap.port).await?;
+                let mut session = imap::login(client, &account.imap.username, &password).await?;
+                imap::select_state(&mut session, mailbox).await?;
+                let raw = imap::fetch_raw(&mut session, uid).await?;
+                let _ = imap::logout(session).await;
+                let raw = raw.ok_or_else(|| Error::Invalid(format!("the server no longer has uid {uid} in {mailbox}")))?;
+                let mut h = crate::store::MessageHeader::default();
+                imap::parse_header_fields(&raw, &mut h);
+                let cc = h.cc_addrs.unwrap_or_default();
+                self.store().set_message_cc(mb_id, uid, &cc)?;
+                cc
+            }
+        };
+        Ok(reply_all_recipients(&account.email, row.header.from_addr.as_deref(), row.header.to_addrs.as_deref(), &cc))
+    }
+
     /// Headers plus parsed body. The body is downloaded once and cached; later calls are local.
     pub async fn fetch_message(&self, key: &str, mailbox: &str, uid: u32) -> Result<MessageDetail> {
         let account = self.store().find_account(key)?;
@@ -975,6 +1189,10 @@ mod tests {
             })
             .unwrap();
         (acct, port)
+    }
+
+    fn imap_port_of(acct: &Account) -> u16 {
+        acct.imap.port
     }
 
     async fn plain_session(port: u16, acct: &Account) -> async_imap::Session<tokio::net::TcpStream> {
@@ -1352,6 +1570,103 @@ mod tests {
         let r = api.outbox_flush().await.unwrap();
         assert_eq!(r.sent, 1);
         assert!(api.outbox_retry(&out.item.id).is_err(), "a sent item cannot be retried");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An account wired to both a fake IMAP and a fake SMTP server.
+    async fn mail_account(api: &Api, provider: Provider) -> (Shared, SmtpShared) {
+        let imap: Shared = std::sync::Arc::new(std::sync::Mutex::new(FakeState::standard()));
+        let imap_port = crate::imap::fake_server::start_with(imap.clone()).await;
+        let smtp: SmtpShared = std::sync::Arc::new(std::sync::Mutex::new(SmtpState::default()));
+        let smtp_port = crate::smtp::fake_smtp::start(smtp.clone()).await;
+        api.add_account(AddAccountRequest {
+            name: "Mailer".into(), replace: false, email: "fred@example.com".into(), provider,
+            password: "good-password".into(), imap_host: Some("127.0.0.1".into()), imap_port: Some(imap_port),
+            smtp_host: Some("127.0.0.1".into()), smtp_port: Some(smtp_port),
+        })
+        .unwrap();
+        (imap, smtp)
+    }
+
+    #[tokio::test]
+    async fn sent_mail_is_filed_in_the_sent_folder_once_it_is_known_and_retried_until_then() {
+        let (api, dir) = test_api();
+        let api = api.with_plain_smtp();
+        let (imap, _smtp) = mail_account(&api, Provider::Custom).await;
+
+        // The Sent folder is not known before the first sync: delivery works, the copy waits.
+        let out = api.send(req("Dinner")).await.unwrap();
+        assert!(out.delivered);
+        assert_eq!(out.item.sent_copy, "failed");
+        assert!(out.item.copy_error.as_deref().unwrap().contains("Sent folder"), "{:?}", out.item.copy_error);
+        assert!(imap.lock().unwrap().appended.is_empty());
+
+        let acct = api.store().find_account("Mailer").unwrap();
+        api.sync_all_with_session(plain_session(imap_port_of(&acct), &acct).await, &acct, SyncOptions::default()).await.unwrap();
+        let r = api.outbox_flush().await.unwrap();
+        assert_eq!(r.sent, 0, "nothing new was delivered");
+        let item = api.outbox_list(None, true, 10).unwrap().remove(0);
+        assert_eq!((item.state.as_str(), item.sent_copy.as_str()), ("sent", "done"));
+        let st = imap.lock().unwrap();
+        assert_eq!(st.appended.len(), 1);
+        let (mailbox, flags, raw) = &st.appended[0];
+        assert_eq!((mailbox.as_str(), flags.as_str()), ("Sent Messages", "\\Seen"));
+        assert!(raw.contains("Subject: Dinner"));
+        assert!(!raw.contains("audit@example.com"), "Bcc must not appear in the filed copy");
+        drop(st);
+
+        // A second flush does not file it again.
+        api.outbox_flush().await.unwrap();
+        assert_eq!(imap.lock().unwrap().appended.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reply_all_drops_me_and_repeats_and_handles_comma_names() {
+        let r = reply_all_recipients(
+            "fred@example.com",
+            Some("sam@example.com"),
+            Some("Fred <fred@example.com>, Doe, John <john@example.com>, sam@example.com"),
+            "Kim <KIM@example.com>, john@example.com, fred@example.com",
+        );
+        assert_eq!(r.to, vec!["sam@example.com"]);
+        assert_eq!(r.cc, vec!["john@example.com", "KIM@example.com"]);
+        // Replying to something I sent goes to the people I wrote to.
+        let r = reply_all_recipients("fred@example.com", Some("Fred@Example.com"), Some("jill@example.com"), "kim@example.com");
+        assert_eq!((r.to, r.cc), (vec!["jill@example.com".to_string()], vec!["kim@example.com".to_string()]));
+    }
+
+    #[test]
+    fn drafts_save_update_list_and_delete() {
+        let (api, dir) = test_api();
+        api.add_account(AddAccountRequest {
+            name: "Mailer".into(), replace: false, email: "fred@example.com".into(), provider: Provider::Custom,
+            password: "pw".into(), imap_host: Some("127.0.0.1".into()), imap_port: None, smtp_host: Some("127.0.0.1".into()), smtp_port: None,
+        })
+        .unwrap();
+        let first = api.draft_save(Draft { account: "Mailer".into(), subject: "Plans".into(), body: "half a thought".into(), ..Default::default() }).unwrap();
+        assert!(!first.id.is_empty());
+        let again = api.draft_save(Draft { body: "a whole thought".into(), to: vec!["jill@example.com".into()], reply_to: Some(("INBOX".into(), 7)), ..first.clone() }).unwrap();
+        assert_eq!(again.id, first.id, "saving with an id updates the same draft");
+        let all = api.draft_list().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].body.as_str(), all[0].to.len(), all[0].reply_to.clone()), ("a whole thought", 1, Some(("INBOX".to_string(), 7))));
+        assert_eq!(api.draft_get(&first.id).unwrap().subject, "Plans");
+        api.draft_delete(&first.id).unwrap();
+        assert!(api.draft_list().unwrap().is_empty());
+        assert!(api.draft_delete(&first.id).is_err());
+        assert!(api.draft_save(Draft { account: "nobody".into(), ..Default::default() }).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn gmail_is_left_to_file_its_own_copy() {
+        let (api, dir) = test_api();
+        let api = api.with_plain_smtp();
+        let (imap, _smtp) = mail_account(&api, Provider::Gmail).await;
+        let out = api.send(req("Hello")).await.unwrap();
+        assert_eq!((out.item.state.as_str(), out.item.sent_copy.as_str()), ("sent", "skipped"));
+        assert!(imap.lock().unwrap().appended.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

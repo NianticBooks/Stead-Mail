@@ -19,6 +19,20 @@ Service / Keychain with an encrypted-file fallback; hybrid AI (local Ollama for 
 triage, cloud for drafting) with 100% human-in-the-loop; Google Calendar REST + iCloud CalDAV
 two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
+## Phase 7 (mail completeness) — what exists
+
+- **Sent copy.** After a message is delivered, a copy is filed in the account's Sent folder with IMAP APPEND
+  (iCloud does not do it for you). Gmail is skipped because it files its own. The Sent folder is found by its
+  special-use flag, then by common names, so an account must have been synced once. If filing fails the message
+  still counts as sent; the copy is retried on the next `outbox flush`/`run`. Bcc is never in the filed copy.
+- **Reply all.** `message.reply_all` (GUI: Reply all button, `Shift+R`) returns the sender plus every other To/Cc
+  address minus your own, without repeats. Replying to a message you sent goes to its original recipients. The Cc
+  header is now stored at sync time; older cached messages read it from the server once.
+- **Drafts.** Closing a changed compose window offers Save draft / Discard / Keep editing. Drafts live in the local
+  database only (`drafts.save|list|get|delete`, `mailcore drafts list|show|delete`, sidebar Drafts). They are not
+  mirrored to the server's Drafts folder, so they do not appear in other mail apps. Sending a draft deletes it.
+- Schema v11 (outbox sent_copy/copy_error, messages.cc_addrs, drafts).
+
 ## Phase 6 (two-way calendar sync) — what exists
 
 - **Linked calendars.** `mailcore cal remote` lists what your Google and iCloud accounts offer; `cal link "Name"`

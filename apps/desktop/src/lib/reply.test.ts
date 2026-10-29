@@ -61,3 +61,14 @@ describe("parseRecipients", () => {
     expect(parseRecipients("  ")).toEqual([]);
   });
 });
+
+describe("buildReplyAll", () => {
+  it("fills To and Cc from the core and keeps threading and quoting", async () => {
+    const { buildReplyAll } = await import("./reply");
+    const r = buildReplyAll(detail(), { to: ["a@x.com"], cc: ["b@x.com", "c@x.com"] });
+    expect(r.to).toEqual(["a@x.com"]);
+    expect(r.cc).toEqual(["b@x.com", "c@x.com"]);
+    expect(r.inReplyTo).toBe("<m2@x.com>");
+    expect(r.subject).toMatch(/^Re: /);
+  });
+});

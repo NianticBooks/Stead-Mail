@@ -27,6 +27,19 @@
     app.compose = null;
   }
 
+  async function keep() {
+    if (await app.saveDraft()) {
+      app.toast("success", "Draft saved");
+      app.compose = null;
+    }
+  }
+
+  function discard() {
+    const id = app.compose?.draftId;
+    app.compose = null;
+    if (id) void app.deleteDraft(id);
+  }
+
   function onkeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.stopPropagation();
@@ -50,7 +63,7 @@
   <div class="overlay" role="dialog" aria-modal="true" aria-label="New message" tabindex="-1" use:autofocus={c.to ? "textarea" : 'input[aria-label="To"]'}>
     <div class="modal compose">
       <header>
-        <h2>{c.inReplyTo ? "Reply" : "New message"}</h2>
+        <h2>{c.draftId ? "Draft" : c.inReplyTo ? "Reply" : "New message"}</h2>
         <button class="icon-btn" onclick={close} aria-label="Close"><Icon name="x" /></button>
       </header>
 
@@ -91,8 +104,9 @@
 
       {#if confirmDiscard}
         <div class="confirm" role="alertdialog">
-          <span>Discard this message?</span>
-          <button class="btn danger sm" onclick={() => (app.compose = null)}>Discard</button>
+          <span>Keep this message?</span>
+          <button class="btn primary sm" onclick={keep}>Save draft</button>
+          <button class="btn danger sm" onclick={discard}>Discard</button>
           <button class="btn sm" onclick={() => (confirmDiscard = false)}>Keep editing</button>
         </div>
       {/if}

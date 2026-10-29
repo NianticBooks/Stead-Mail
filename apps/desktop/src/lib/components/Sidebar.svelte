@@ -103,6 +103,10 @@
   {/if}
 
   <div class="foot">
+    <button class="foot-btn" onclick={() => (app.draftsOpen = true)} title="Saved drafts">
+      <Icon name="file" size={15} /> Drafts
+      {#if app.drafts.length > 0}<span class="badge">{app.drafts.length}</span>{/if}
+    </button>
     <button class="foot-btn" class:alert={app.failedOutbox > 0} onclick={() => (app.outboxOpen = true)} title="Outgoing mail">
       <Icon name="send" size={15} /> Outbox
       {#if app.pendingOutbox > 0}<span class="badge" class:danger={app.failedOutbox > 0} class:warn={app.failedOutbox === 0}>{app.pendingOutbox}</span>{/if}

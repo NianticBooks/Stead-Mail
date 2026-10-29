@@ -104,6 +104,19 @@ struct HtmlParams {
 }
 
 #[derive(Deserialize)]
+struct DraftIdParams {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct ReplyAllParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    uid: u32,
+}
+
+#[derive(Deserialize)]
 struct FlagParams {
     account: String,
     #[serde(default = "default_mailbox")]
@@ -287,6 +300,24 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
             "outbox.list" => {
                 let p: OutboxListParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.outbox_list(p.account.as_deref(), p.all, p.limit as usize)?)
+            }
+            "drafts.save" => {
+                let d: crate::api::Draft = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.draft_save(d)?)
+            }
+            "drafts.list" => to_json(&api.draft_list()?),
+            "drafts.get" => {
+                let p: DraftIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.draft_get(&p.id)?)
+            }
+            "drafts.delete" => {
+                let p: DraftIdParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                api.draft_delete(&p.id)?;
+                to_json(&serde_json::json!({ "deleted": p.id }))
+            }
+            "message.reply_all" => {
+                let p: ReplyAllParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.reply_all(&p.account, &p.mailbox, p.uid).await?)
             }
             "outbox.flush" => to_json(&api.outbox_flush().await?),
             "outbox.retry" => {
@@ -614,6 +645,30 @@ mod tests {
         let second = serve_unix(api.clone(), &sock).await.unwrap_err();
         assert_eq!(second.kind(), std::io::ErrorKind::AddrInUse);
         server.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn draft_methods_round_trip_over_rpc() {
+        let dir = std::env::temp_dir().join(format!("mailcore-rpc-{}", uuid::Uuid::new_v4()));
+        let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("s.json"), "pw").unwrap();
+        let api = Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir.clone());
+        api.add_account(crate::api::AddAccountRequest {
+            name: "Mailer".into(), replace: false, email: "fred@example.com".into(), provider: crate::account::Provider::Custom,
+            password: "pw".into(), imap_host: Some("127.0.0.1".into()), imap_port: None, smtp_host: Some("127.0.0.1".into()), smtp_port: None,
+        })
+        .unwrap();
+        let call = |method: &str, params: serde_json::Value| {
+            let req: Request = serde_json::from_value(json!({"id": 1, "method": method, "params": params})).unwrap();
+            let api = &api;
+            async move { dispatch(api, req).await }
+        };
+        let saved = call("drafts.save", json!({"account": "Mailer", "subject": "Hi", "to": ["jill@example.com"]})).await.result.unwrap();
+        let id = saved["id"].as_str().unwrap().to_string();
+        assert_eq!(call("drafts.list", json!({})).await.result.unwrap()[0]["subject"], "Hi");
+        assert!(call("drafts.delete", json!({"id": id})).await.error.is_none());
+        assert_eq!(call("drafts.list", json!({})).await.result.unwrap(), json!([]));
+        assert!(call("drafts.save", json!({"subject": "no account"})).await.error.is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 

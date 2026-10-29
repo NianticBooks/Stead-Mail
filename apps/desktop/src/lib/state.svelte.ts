@@ -1,7 +1,8 @@
 import { listen } from "@tauri-apps/api/event";
 import { open as pickFiles } from "@tauri-apps/plugin-dialog";
 import { api, shell } from "./api";
-import { parseRecipients, buildReply, type ComposeInit } from "./reply";
+import type { Draft } from "./types";
+import { parseRecipients, buildReply, buildReplyAll, type ComposeInit } from "./reply";
 import { isUnread } from "./format";
 import { folderEntries } from "./mailboxes";
 import type {
@@ -32,6 +33,8 @@ export interface Compose {
   sending: boolean;
   error: string | null;
   dirty: boolean;
+  /** Set once the message has been saved as a draft; later saves update the same one. */
+  draftId?: string;
   /** The message being answered. AI drafting needs it; a brand new message has none. */
   replyTo?: { account: string; mailbox: string; uid: number };
   ai: { open: boolean; instruction: string; provider: ProviderKind; busy: boolean; error: string | null; preview: CloudPreview | null; undo: string | null };
@@ -99,6 +102,8 @@ class App {
   compose = $state<Compose | null>(null);
   settingsOpen = $state(false);
   outboxOpen = $state(false);
+  draftsOpen = $state(false);
+  drafts = $state<Draft[]>([]);
   helpOpen = $state(false);
   prefs = $state<Prefs>(loadPrefs());
 
@@ -132,6 +137,7 @@ class App {
       await this.selectAccount(this.accounts[0].id);
     }
     void this.refreshOutbox();
+    void this.refreshDrafts();
     this.booted = true;
   }
 
@@ -655,9 +661,9 @@ class App {
     this.compose = {
       accountId,
       to: (init?.to ?? []).join(", "),
-      cc: "",
+      cc: (init?.cc ?? []).join(", "),
       bcc: "",
-      showCc: false,
+      showCc: (init?.cc?.length ?? 0) > 0,
       subject: init?.subject ?? "",
       body: init?.body ?? "",
       attachments: [],
@@ -674,6 +680,17 @@ class App {
   reply() {
     if (!this.detail || !this.accountId) return;
     this.openCompose({ ...buildReply(this.detail), replyTo: { account: this.accountId, mailbox: this.detail.mailbox, uid: this.detail.uid } } as Partial<ComposeInit>);
+  }
+
+  async replyAll() {
+    const d = this.detail;
+    if (!d || !this.accountId) return;
+    try {
+      const who = await api.replyAll(this.accountId, d.mailbox, d.uid);
+      this.openCompose({ ...buildReplyAll(d, who), replyTo: { account: this.accountId, mailbox: d.mailbox, uid: d.uid } } as Partial<ComposeInit>);
+    } catch (e) {
+      this.toast("error", errText(e));
+    }
   }
 
   async attachFiles() {
@@ -707,10 +724,10 @@ class App {
       });
       if (out.item.state === "sent") {
         this.toast("success", "Message sent");
-        this.compose = null;
+        this.#finishDraft(c);
       } else if (out.item.state === "queued") {
         this.toast("info", `Could not reach the mail server yet. It is queued and will be retried. (${out.item.last_error ?? ""})`);
-        this.compose = null;
+        this.#finishDraft(c);
       } else {
         c.error = out.item.last_error ?? "The server rejected the message.";
         c.sending = false;
@@ -720,6 +737,69 @@ class App {
       c.sending = false;
     }
     void this.refreshOutbox();
+  }
+
+  /** The message left the compose window for good (sent or queued): its draft, if any, is done. */
+  #finishDraft(c: Compose) {
+    this.compose = null;
+    if (c.draftId) void this.deleteDraft(c.draftId);
+  }
+
+  async refreshDrafts() {
+    try {
+      this.drafts = await api.drafts();
+    } catch {
+      /* drafts are secondary: stay quiet if they are momentarily unavailable */
+    }
+  }
+
+  /** Keep the open compose window as a draft. Returns true when it was saved. */
+  async saveDraft(): Promise<boolean> {
+    const c = this.compose;
+    if (!c) return false;
+    const account = this.accounts.find((a) => a.id === c.accountId);
+    if (!account) return false;
+    try {
+      const saved = await api.draftSave({
+        id: c.draftId, account: account.name, to: parseRecipients(c.to), cc: parseRecipients(c.cc), bcc: parseRecipients(c.bcc),
+        subject: c.subject, body: c.body, in_reply_to: c.inReplyTo ?? null, references: c.references,
+        attachments: c.attachments.map((a) => a.path), reply_to: c.replyTo ? [c.replyTo.mailbox, c.replyTo.uid] : null,
+      });
+      c.draftId = saved.id;
+      c.dirty = false;
+      void this.refreshDrafts();
+      return true;
+    } catch (e) {
+      this.toast("error", `Could not save the draft: ${errText(e)}`);
+      return false;
+    }
+  }
+
+  openDraft(d: Draft) {
+    if (this.compose?.sending) return;
+    const account = this.accounts.find((a) => a.name === d.account);
+    if (!account) {
+      this.toast("error", `The account "${d.account}" no longer exists.`);
+      return;
+    }
+    this.openCompose({ to: d.to, cc: d.cc, subject: d.subject, body: d.body, inReplyTo: d.in_reply_to ?? undefined, references: d.references });
+    const c = this.compose!;
+    c.accountId = account.id;
+    c.bcc = d.bcc.join(", ");
+    c.draftId = d.id;
+    c.attachments = d.attachments.map((p) => ({ path: p, name: p.split(/[\\/]/).pop() ?? p }));
+    if (d.reply_to) c.replyTo = { account: account.id, mailbox: d.reply_to[0], uid: d.reply_to[1] };
+    c.showCc = d.cc.length > 0 || d.bcc.length > 0;
+    this.draftsOpen = false;
+  }
+
+  async deleteDraft(id: string) {
+    try {
+      await api.draftDelete(id);
+    } catch (e) {
+      this.toast("error", errText(e));
+    }
+    void this.refreshDrafts();
   }
 
   async refreshOutbox() {

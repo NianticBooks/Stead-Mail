@@ -113,6 +113,11 @@ enum Cmd {
         #[arg(long)]
         queue_only: bool,
     },
+    /// Unsent messages saved on this machine.
+    Drafts {
+        #[command(subcommand)]
+        cmd: DraftsCmd,
+    },
     /// Inspect and run the outgoing queue.
     Outbox {
         #[command(subcommand)]
@@ -356,6 +361,16 @@ enum KeyCmd {
 }
 
 #[derive(Subcommand)]
+enum DraftsCmd {
+    /// List saved drafts, newest first.
+    List,
+    /// Print one draft.
+    Show { id: String },
+    /// Delete a draft.
+    Delete { id: String },
+}
+
+#[derive(clap::Subcommand)]
 enum OutboxCmd {
     /// Show queued, sending and failed messages (add --all for sent and cancelled too).
     List {
@@ -592,6 +607,24 @@ async fn main() -> Result<()> {
                 })
             }
         }
+        Cmd::Drafts { cmd } => match cmd {
+            DraftsCmd::List => out(cli.json, &api.draft_list()?, |l| {
+                if l.is_empty() {
+                    println!("no drafts");
+                }
+                for d in l {
+                    println!("{}  {:<22} {:<28.28} {}", short(&d.id), d.updated_at.get(..19).unwrap_or(&d.updated_at), d.to.join(","), if d.subject.is_empty() { "(no subject)" } else { &d.subject });
+                }
+            }),
+            DraftsCmd::Show { id } => out(cli.json, &api.draft_get(&id)?, |d| {
+                println!("Account: {}\nTo:      {}\nCc:      {}\nSubject: {}\n\n{}", d.account, d.to.join(", "), d.cc.join(", "), d.subject, d.body);
+            }),
+            DraftsCmd::Delete { id } => {
+                let full = api.draft_list()?.into_iter().find(|d| d.id.starts_with(&id)).map(|d| d.id).ok_or_else(|| anyhow::anyhow!("no draft '{id}'"))?;
+                api.draft_delete(&full)?;
+                println!("deleted {}", short(&full));
+            }
+        },
         Cmd::Outbox { cmd } => match cmd {
             OutboxCmd::List { account, all } => out(cli.json, &api.outbox_list(account.as_deref(), all, 100)?, |l| {
                 if l.is_empty() {

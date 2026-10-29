@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Account, AddAccountInput, AiConfig, AiStatus, Analysis, AuditReport, CalEvent, CalSyncReport, Calendar, EventInput, RemoteList, SyncLogEntry, ImportReport, Occurrence, CloudPreview, DraftResult, EventProposal, ProviderKind, CalendarSummary, ConnectionReport, Mailbox, MessageDetail, MessageRow, OAuthIdentity,
-  OutboxItem, SanitizedHtml, SavedAttachment, SearchHit, SendOutcome, SyncReport,
+  Draft, OutboxItem, SanitizedHtml, SavedAttachment, SearchHit, SendOutcome, SyncReport,
 } from "./types";
 
 /** One call into the core's JSON-RPC surface. Rejects with the core's own error message. */
@@ -50,6 +50,10 @@ export const api = {
 
   sync: (account: string, mailbox: string, limit = 50, backfill = 0) => rpc<SyncReport>("sync", { account, mailbox, limit, backfill }),
   send: (s: SendInput) => rpc<SendOutcome>("send", { ...s }),
+  replyAll: (account: string, mailbox: string, uid: number) => rpc<{ to: string[]; cc: string[] }>("message.reply_all", { account, mailbox, uid }),
+  drafts: () => rpc<Draft[]>("drafts.list"),
+  draftSave: (d: Omit<Draft, "id" | "updated_at"> & { id?: string }) => rpc<Draft>("drafts.save", { ...d }),
+  draftDelete: (id: string) => rpc<{ deleted: string }>("drafts.delete", { id }),
   outbox: (all = false) => rpc<OutboxItem[]>("outbox.list", { all, limit: 50 }),
   outboxRetry: (id: string) => rpc<OutboxItem>("outbox.retry", { id }),
   outboxCancel: (id: string) => rpc<OutboxItem>("outbox.cancel", { id }),

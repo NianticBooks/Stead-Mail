@@ -3,6 +3,7 @@ import type { MessageDetail } from "./types";
 
 export interface ComposeInit {
   to: string[];
+  cc?: string[];
   subject: string;
   body: string;
   inReplyTo?: string;
@@ -36,6 +37,11 @@ export function buildReply(d: MessageDetail): ComposeInit {
     inReplyTo: d.message_id ?? undefined,
     references: refs,
   };
+}
+
+/** Reply to everyone: `who` comes from the core, which knows the account's own address. */
+export function buildReplyAll(d: MessageDetail, who: { to: string[]; cc: string[] }): ComposeInit {
+  return { ...buildReply(d), to: who.to, cc: who.cc };
 }
 
 /** Split a typed recipient list on commas, semicolons and whitespace; drop empties and repeats. */

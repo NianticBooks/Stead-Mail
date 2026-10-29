@@ -38,6 +38,7 @@
         <h1>{d.subject || "(no subject)"}</h1>
         <div class="actions">
           <button class="btn sm" onclick={() => app.reply()} title="Reply (r)"><Icon name="reply" size={14} /> Reply</button>
+          <button class="btn sm" onclick={() => void app.replyAll()} title="Reply to everyone (Shift+R)">Reply all</button>
           <button class="icon-btn" onclick={() => app.setSeen(d.uid, isUnread(d))} title={isUnread(d) ? "Mark as read (u)" : "Mark as unread (u)"} aria-label={isUnread(d) ? "Mark as read" : "Mark as unread"}>
             <Icon name="mail" fill={isUnread(d)} />
           </button>
