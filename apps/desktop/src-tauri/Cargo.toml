@@ -14,6 +14,11 @@ edition.workspace = true
 name = "desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Serve the embedded frontend instead of the dev server. Release builds must enable it
+# (`tauri build` does so itself; plain `cargo build --release` needs --features custom-protocol).
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

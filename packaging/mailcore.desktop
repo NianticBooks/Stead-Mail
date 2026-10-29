@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Mailcore
+GenericName=Mail and Calendar
+Comment=AI-native email and calendar client
+Exec=mailcore-desktop
+Icon=mailcore
+Terminal=false
+Categories=Network;Email;Office;Calendar;
+Keywords=email;mail;calendar;imap;
+StartupWMClass=desktop

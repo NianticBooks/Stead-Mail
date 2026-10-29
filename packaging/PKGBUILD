@@ -1,0 +1,53 @@
+# Maintainer: Fred Book <claude@nianticbooks.com>
+pkgname=mailcore-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Dark-mode, AI-native desktop email and calendar client (IMAP, CalDAV, Google Calendar)'
+arch=('x86_64')
+url='https://github.com/FredN9MRQ/ai-mail-client'
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'openssl' 'libsecret')
+makedepends=('git' 'rust' 'nodejs' 'npm')
+optdepends=('ollama: local model for triage and event extraction (AI is off by default)'
+            'gnome-keyring: store passwords in the Secret Service instead of an encrypted file')
+provides=('mailcore')
+conflicts=('mailcore')
+# MAILCORE_SRC lets you build a local checkout: MAILCORE_SRC=/path/to/ai-mail-client makepkg -f
+source=("mailcore::git+${MAILCORE_SRC:-$url.git}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd mailcore
+  printf '%s.r%s.%s' "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" \
+    "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd mailcore
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+  (cd apps/desktop && npm ci --no-audit --no-fund)
+}
+
+build() {
+  cd mailcore
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  (cd apps/desktop && npm run build)
+  cargo build --release --locked -p mailcore-cli -p desktop --features desktop/custom-protocol
+}
+
+check() {
+  cd mailcore
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo test --release --locked -p mailcore
+}
+
+package() {
+  cd mailcore
+  install -Dm755 target/release/mailcore "$pkgdir/usr/bin/mailcore"
+  install -Dm755 target/release/desktop "$pkgdir/usr/bin/mailcore-desktop"
+  install -Dm644 packaging/mailcore.desktop "$pkgdir/usr/share/applications/mailcore.desktop"
+  install -Dm644 apps/desktop/src-tauri/icons/128x128.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/mailcore.png"
+  install -Dm644 apps/desktop/src-tauri/icons/32x32.png "$pkgdir/usr/share/icons/hicolor/32x32/apps/mailcore.png"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
