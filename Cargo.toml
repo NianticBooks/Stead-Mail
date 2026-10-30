@@ -10,7 +10,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/FredN9MRQ/ai-mail-client"
+repository = "https://github.com/NianticBooks/Stead-Mail"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "fs"] }

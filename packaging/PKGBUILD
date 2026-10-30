@@ -4,7 +4,7 @@ pkgver=0.1.0.r11.618e239
 pkgrel=1
 pkgdesc='Your mail stays home. Dark-mode, AI-native desktop email and calendar client (IMAP, CalDAV, Google Calendar)'
 arch=('x86_64')
-url='https://github.com/FredN9MRQ/ai-mail-client'
+url='https://github.com/NianticBooks/Stead-Mail'
 license=('MIT')
 depends=('webkit2gtk-4.1' 'gtk3' 'openssl' 'libsecret')
 makedepends=('git' 'rust' 'nodejs' 'npm')
@@ -14,7 +14,7 @@ optdepends=('ollama: local model for triage and event extraction (AI is off by d
 options=('!lto')
 provides=('stead')
 conflicts=('stead')
-# STEAD_SRC lets you build a local checkout: STEAD_SRC=/path/to/ai-mail-client makepkg -f
+# STEAD_SRC lets you build a local checkout: STEAD_SRC=/path/to/Stead-Mail makepkg -f
 source=("stead::git+${STEAD_SRC:-$url.git}")
 sha256sums=('SKIP')
 
