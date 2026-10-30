@@ -143,7 +143,7 @@ impl Api {
         check_writable(&store.conn, id)?;
         let tx = store.conn.transaction()?;
         for it in items {
-            let uid = it.uid.clone().unwrap_or_else(|| format!("{}@mailcore", uuid::Uuid::new_v4()));
+            let uid = it.uid.clone().unwrap_or_else(|| format!("{}@stead", uuid::Uuid::new_v4()));
             let existing = db::event_by_uid(&tx, id, &uid)?;
             let ev = Event {
                 id: existing.as_ref().map(|e| e.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
@@ -227,7 +227,7 @@ fn build_event(conn: &rusqlite::Connection, input: &EventInput, current: Option<
     Ok(Event {
         id: current.map(|c| c.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
         calendar_id,
-        uid: current.map(|c| c.uid.clone()).unwrap_or_else(|| format!("{}@mailcore", uuid::Uuid::new_v4())),
+        uid: current.map(|c| c.uid.clone()).unwrap_or_else(|| format!("{}@stead", uuid::Uuid::new_v4())),
         title,
         description: input.description.as_deref().map(|d| clean_text(d, 5000)).filter(|d| !d.is_empty()),
         location: input.location.as_deref().map(|d| clean_text(d, 300).replace('\n', " ")).filter(|d| !d.is_empty()),
@@ -282,7 +282,7 @@ mod tests {
     use crate::store::Store;
 
     fn api() -> Api {
-        let dir = std::env::temp_dir().join(format!("mailcore-cal-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stead-cal-{}", uuid::Uuid::new_v4()));
         let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("secrets.enc.json"), "pw").unwrap();
         let api = Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir);
         api.ai_set_config(AiConfig { timezone: "America/Chicago".into(), ..api.ai_config().unwrap() }).unwrap();
@@ -304,7 +304,7 @@ mod tests {
         let ev = api.event_create(EventInput { location: Some("Café".into()), attendees: vec!["a@example.com".into(), "A@example.com".into()], ..timed("  Dentist \n", "2026-10-29T14:30", Some("2026-10-29T15:15")) }).unwrap();
         assert_eq!((ev.title.as_str(), ev.start_utc.as_str(), ev.end_utc.as_str(), ev.calendar_id.as_str()), ("Dentist", "2026-10-29T19:30:00Z", "2026-10-29T20:15:00Z", "personal"));
         assert_eq!((ev.tz.as_deref(), ev.attendees.len(), ev.sequence), (Some("America/Chicago"), 1, 0));
-        assert!(ev.uid.ends_with("@mailcore"));
+        assert!(ev.uid.ends_with("@stead"));
 
         let day = api.calendar_range("2026-10-29T00:00:00Z", "2026-10-30T00:00:00Z", None).unwrap();
         assert_eq!(titles(&day), vec!["Dentist"]);

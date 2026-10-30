@@ -1,4 +1,4 @@
-//! Tauri desktop shell. Mail logic lives in `mailcore`; the single `rpc` command passes the same
+//! Tauri desktop shell. Mail logic lives in `stead`; the single `rpc` command passes the same
 //! JSON-RPC methods the CLI daemon serves straight through, so the UI and every other client see
 //! one API. Only what needs the desktop shell is handled here: opening the browser for sign-in,
 //! opening links and files, and background IDLE watchers that push live updates to the window.
@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mailcore::api::SyncReport;
-use mailcore::rpc::{self, Request};
-use mailcore::sync::SyncOptions;
-use mailcore::Api;
+use stead::api::SyncReport;
+use stead::rpc::{self, Request};
+use stead::sync::SyncOptions;
+use stead::Api;
 use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -28,7 +28,7 @@ struct Diag {
     wayland_display: Option<String>,
     hyprland: bool,
     nv_disable_explicit_sync: Option<String>,
-    core: Option<mailcore::api::PingInfo>,
+    core: Option<stead::api::PingInfo>,
     core_error: Option<String>,
 }
 
@@ -192,7 +192,7 @@ pub fn run() {
     let api = Arc::new(match Api::open_default() {
         Ok(api) => api,
         Err(e) => {
-            eprintln!("mailcore: failed to open core: {e}");
+            eprintln!("stead: failed to open core: {e}");
             std::process::exit(2);
         }
     });
@@ -241,13 +241,13 @@ pub fn run() {
 
 /// Desktop notification through `notify-send` (libnotify), which mako, dunst and GNOME all serve.
 /// Quietly does nothing when it is missing; the in-window toast still shows.
-fn notify_reminder(r: &mailcore::calendar::remind::DueReminder) {
+fn notify_reminder(r: &stead::calendar::remind::DueReminder) {
     let when = if r.minutes == 0 { "now".to_string() } else if r.minutes % 1440 == 0 { format!("in {} day(s)", r.minutes / 1440) } else if r.minutes % 60 == 0 { format!("in {} h", r.minutes / 60) } else { format!("in {} min", r.minutes) };
     let body = match &r.location {
         Some(l) if !l.is_empty() => format!("Starts {when} · {l}"),
         _ => format!("Starts {when}"),
     };
     let _ = std::process::Command::new("notify-send")
-        .args(["--app-name=Mailcore", "--icon=appointment-soon", "--urgency=normal", &r.title, &body])
+        .args(["--app-name=Stead", "--icon=appointment-soon", "--urgency=normal", &r.title, &body])
         .spawn();
 }

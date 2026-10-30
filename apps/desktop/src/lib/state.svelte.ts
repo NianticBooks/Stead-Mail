@@ -51,7 +51,7 @@ interface Prefs {
   markReadOnOpen: boolean;
 }
 
-const PREFS_KEY = "mailcore.prefs";
+const PREFS_KEY = "stead.prefs";
 
 function loadPrefs(): Prefs {
   try {

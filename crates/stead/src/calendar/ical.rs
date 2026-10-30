@@ -118,7 +118,7 @@ fn write_calendar(name: Option<&str>, events: &[(&Event, Option<&Extra>)]) -> St
     let mut push = |l: String| out.push_str(&fold(&l));
     push("BEGIN:VCALENDAR".into());
     push("VERSION:2.0".into());
-    push("PRODID:-//mailcore//AI mail client//EN".into());
+    push("PRODID:-//stead//AI mail client//EN".into());
     push("CALSCALE:GREGORIAN".into());
     if let Some(name) = name {
         push(format!("X-WR-CALNAME:{}", esc(name)));

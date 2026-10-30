@@ -55,7 +55,7 @@ pub enum Llm {
 
 fn client(timeout: Duration) -> reqwest::Client {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::builder().timeout(timeout).user_agent(concat!("mailcore/", env!("CARGO_PKG_VERSION"))).build().expect("http client")
+    reqwest::Client::builder().timeout(timeout).user_agent(concat!("stead/", env!("CARGO_PKG_VERSION"))).build().expect("http client")
 }
 
 impl Llm {

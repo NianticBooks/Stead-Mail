@@ -277,7 +277,7 @@ CREATE INDEX events_by_start ON events(start_utc);
 
 INSERT INTO events (id, calendar_id, uid, title, location, start_utc, end_utc, all_day, tz, rrule, attendees, source_proposal_id, source_message_id, created_at)
 SELECT lower(hex(randomblob(16))), 'personal',
-       COALESCE(ics_uid, lower(hex(randomblob(12))) || '@mailcore'),
+       COALESCE(ics_uid, lower(hex(randomblob(12))) || '@stead'),
        title, location, start_utc,
        CASE WHEN end_utc IS NOT NULL AND end_utc > start_utc THEN end_utc
             WHEN all_day = 1 THEN strftime('%Y-%m-%dT%H:%M:%SZ', start_utc, '+1 day')
@@ -1229,7 +1229,7 @@ impl Store {
             return Err(Error::Invalid("this is a cancellation notice, not an event to add".into()));
         }
         let cal = crate::calendar::db::default_calendar_id(&tx)?;
-        let uid = uid.unwrap_or_else(|| format!("{}@mailcore", uuid::Uuid::new_v4()));
+        let uid = uid.unwrap_or_else(|| format!("{}@stead", uuid::Uuid::new_v4()));
         if let Some(existing) = crate::calendar::db::event_by_uid(&tx, &cal, &uid)? {
             tx.execute("UPDATE event_proposals SET state = 'accepted' WHERE id = ?1", [id])?;
             tx.commit()?;
@@ -1738,7 +1738,7 @@ mod tests {
         assert_eq!(evs.len(), 3);
         assert_eq!((evs[0].title.as_str(), evs[0].uid.as_str(), evs[0].end_utc.as_str(), evs[0].attendees.clone()), ("Dinner", "inv-1", "2026-10-29T21:00:00Z", vec!["a@example.com".to_string()]));
         assert_eq!(evs[1].end_utc, "2026-10-30T16:00:00Z", "a missing end becomes an hour");
-        assert!(evs[1].uid.ends_with("@mailcore"), "a missing UID is generated");
+        assert!(evs[1].uid.ends_with("@stead"), "a missing UID is generated");
         assert_eq!(evs[2].end_utc, "2026-11-01T05:00:00Z", "an all-day event without an end lasts one day");
         assert!(evs.iter().all(|e| e.calendar_id == "personal"));
     }

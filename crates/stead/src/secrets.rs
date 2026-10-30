@@ -1,6 +1,6 @@
 //! Secret storage. Primary backend is the OS keyring (Secret Service on Linux, Keychain on
 //! macOS). Fallback is a passphrase-encrypted file (ChaCha20-Poly1305, Argon2id KDF) used when
-//! no keyring daemon is reachable or when `MAILCORE_SECRETS=file` is set.
+//! no keyring daemon is reachable or when `STEAD_SECRETS=file` is set.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+// Keyring service kept from the old name so existing stored secrets still resolve.
 const SERVICE: &str = "mailcore";
 
 pub trait SecretStore: Send + Sync {
@@ -85,11 +86,11 @@ pub struct EncryptedFileStore {
 }
 
 impl EncryptedFileStore {
-    /// Open or create the file. The passphrase is taken from `MAILCORE_PASSPHRASE` or prompted.
+    /// Open or create the file. The passphrase is taken from `STEAD_PASSPHRASE` or prompted.
     pub fn open(path: &Path) -> Result<EncryptedFileStore> {
-        let passphrase = match std::env::var("MAILCORE_PASSPHRASE") {
+        let passphrase = match std::env::var("STEAD_PASSPHRASE") {
             Ok(p) if !p.is_empty() => p,
-            _ => rpassword::prompt_password("mailcore secrets passphrase: ")
+            _ => rpassword::prompt_password("stead secrets passphrase: ")
                 .map_err(|e| Error::Secrets(format!("cannot read passphrase: {e}")))?,
         };
         Self::open_with_passphrase(path, &passphrase)
@@ -178,11 +179,11 @@ impl SecretStore for EncryptedFileStore {
 
 // ---------------------------------------------------------------- selection
 
-/// Pick a backend: `MAILCORE_SECRETS=file|keyring` forces one; otherwise try the keyring and
+/// Pick a backend: `STEAD_SECRETS=file|keyring` forces one; otherwise try the keyring and
 /// fall back to the encrypted file in `data_dir`.
 pub fn open_default(data_dir: &Path) -> Result<Box<dyn SecretStore>> {
     let file_path = data_dir.join("secrets.enc.json");
-    match std::env::var("MAILCORE_SECRETS").as_deref() {
+    match std::env::var("STEAD_SECRETS").as_deref() {
         Ok("file") => return Ok(Box::new(EncryptedFileStore::open(&file_path)?)),
         Ok("keyring") => return Ok(Box::new(KeyringStore::probe()?)),
         _ => {}
@@ -219,7 +220,7 @@ mod tests {
 
     #[test]
     fn encrypted_file_roundtrip_and_wrong_passphrase() {
-        let dir = std::env::temp_dir().join(format!("mailcore-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stead-test-{}", uuid::Uuid::new_v4()));
         let path = dir.join("secrets.enc.json");
         let s = EncryptedFileStore::open_with_passphrase(&path, "correct horse").unwrap();
         s.set("account/1/password", "app-specific-pw").unwrap();

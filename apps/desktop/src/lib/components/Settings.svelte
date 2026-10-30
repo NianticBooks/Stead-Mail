@@ -169,7 +169,7 @@
             <p class="muted">Loading…</p>
           {/if}
           {#if app.accounts.length === 0}
-            <div class="welcome"><Icon name="mail" size={30} /><h1>Welcome to Mailcore</h1><p class="muted">Add your first account to get started. Mail stays on this computer.</p></div>
+            <div class="welcome"><Icon name="mail" size={30} /><h1>Welcome to Stead</h1><p class="muted">Add your first account to get started. Mail stays on this computer.</p></div>
           {/if}
 
           {#each app.accounts as a (a.id)}

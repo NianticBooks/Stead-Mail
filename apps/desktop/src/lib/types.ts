@@ -1,4 +1,4 @@
-// Shapes returned by the mailcore JSON-RPC API (serde output of the Rust types).
+// Shapes returned by the stead JSON-RPC API (serde output of the Rust types).
 
 export type Provider = "icloud" | "gmail" | "custom";
 

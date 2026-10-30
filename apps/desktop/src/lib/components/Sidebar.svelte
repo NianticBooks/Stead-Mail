@@ -13,7 +13,7 @@
 
 <aside class="rail" aria-label="Accounts and folders">
   <div class="top">
-    <div class="brand"><Icon name="mail" size={18} /> Mailcore</div>
+    <div class="brand"><Icon name="mail" size={18} /> Stead</div>
     <div class="modes" role="tablist" aria-label="Section">
       <button role="tab" aria-selected={app.view === "mail"} class:on={app.view === "mail"} onclick={() => (app.view = "mail")} title="Mail (g i)"><Icon name="mail" size={14} /> Mail</button>
       <button role="tab" aria-selected={app.view === "calendar"} class:on={app.view === "calendar"} onclick={() => (app.view = "calendar")} title="Calendar (g c)"><Icon name="calendar" size={14} /> Calendar</button>

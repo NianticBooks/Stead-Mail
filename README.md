@@ -1,17 +1,19 @@
-# ai-mail-client (working name)
+# Stead
+
+*Your mail stays home.*
 
 Dark-mode-first, AI-native desktop email + calendar client. Linux first, macOS next.
 
 ## Architecture
 
 ```
-crates/mailcore        Rust core: accounts, SQLite store, secrets, IMAP sync, calendar (later), AI (later)
-crates/mailcore-cli    `mailcore` binary: CLI + JSON-RPC 2.0 daemon (`mailcore serve`)
-apps/desktop           Tauri 2 + Svelte 5 shell. Commands are thin adapters over mailcore::Api
+crates/stead        Rust core: accounts, SQLite store, secrets, IMAP sync, calendar (later), AI (later)
+crates/stead-cli    `stead` binary: CLI + JSON-RPC 2.0 daemon (`stead serve`)
+apps/desktop           Tauri 2 + Svelte 5 shell. Commands are thin adapters over stead::Api
 ```
 
-One rule: **all logic lives in `mailcore::Api`.** The CLI, the daemon and the Tauri shell call the
-same methods. A future native SwiftUI shell (BAMA) talks to `mailcore serve` over JSON-RPC.
+One rule: **all logic lives in `stead::Api`.** The CLI, the daemon and the Tauri shell call the
+same methods. A future native SwiftUI shell (BAMA) talks to `stead serve` over JSON-RPC.
 
 Decisions (2026-10-27): Svelte frontend; Tauri 2, not a pure-Rust UI; separate daemon boundary;
 iCloud + Gmail + generic IMAP first with app passwords; OAuth2 only for Google Calendar; Secret
@@ -30,7 +32,7 @@ two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
 - **Reminders.** Any event can remind you 0 minutes to 7 days before it starts (several per event). They are kept on
   this machine only: never pushed to Google or iCloud, and they work on read-only and synced calendars. In the event
-  dialog: "Remind me". CLI: `mailcore cal remind <id> 10 60` (`none` clears; no minutes shows them). RPC:
+  dialog: "Remind me". CLI: `stead cal remind <id> 10 60` (`none` clears; no minutes shows them). RPC:
   `event.reminders`, `event.set_reminders`, `reminders.poll`.
 - **Delivery.** The desktop app checks every 20 seconds, shows a desktop notification through `notify-send`
   (mako, dunst and GNOME all serve it) and an in-window toast. Reminders only fire while the app is running.
@@ -49,13 +51,13 @@ two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
   address minus your own, without repeats. Replying to a message you sent goes to its original recipients. The Cc
   header is now stored at sync time; older cached messages read it from the server once.
 - **Drafts.** Closing a changed compose window offers Save draft / Discard / Keep editing. Drafts live in the local
-  database only (`drafts.save|list|get|delete`, `mailcore drafts list|show|delete`, sidebar Drafts). They are not
+  database only (`drafts.save|list|get|delete`, `stead drafts list|show|delete`, sidebar Drafts). They are not
   mirrored to the server's Drafts folder, so they do not appear in other mail apps. Sending a draft deletes it.
 - Schema v11 (outbox sent_copy/copy_error, messages.cc_addrs, drafts).
 
 ## Phase 6 (two-way calendar sync) — what exists
 
-- **Linked calendars.** `mailcore cal remote` lists what your Google and iCloud accounts offer; `cal link "Name"`
+- **Linked calendars.** `stead cal remote` lists what your Google and iCloud accounts offer; `cal link "Name"`
   mirrors one as a local calendar (`kind` google or caldav). Linking never changes the server. `cal unlink` drops the
   local copy only. In the GUI: the link button in the Calendars header opens "Connect calendars".
 - **Pull first, then push.** Google uses `syncToken` deltas (first sync reaches back 90 days; an expired token
@@ -63,15 +65,15 @@ two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
   Local creates, edits and deletes are sent with `If-Match`, so the server refuses a write over a version we never saw.
 - **Remote wins, visibly.** When the same event changed on both sides, the server's version is kept and the log records
   both versions ("Yours: … / Server: …"). The same goes for deleted-there/edited-here and deleted-here/changed-there
-  (the event comes back, logged). Nothing is lost silently: `mailcore cal log` or the GUI's Sync log.
+  (the event comes back, logged). Nothing is lost silently: `stead cal log` or the GUI's Sync log.
 - **Fidelity.** Alarms and changed single occurrences of an iCloud series are kept verbatim and written back on edit,
   so an edit here does not delete a reminder there. Google single-occurrence removals become exceptions here.
   Pushing never sends invitations (`sendUpdates=none`). Retried creates cannot duplicate (Google ids derive from ours).
-- **When it runs:** `s` in the calendar, the refresh button, `mailcore cal sync`, on first opening the calendar, and
+- **When it runs:** `s` in the calendar, the refresh button, `stead cal sync`, on first opening the calendar, and
   every five minutes while the app is open. One sync at a time; a failing calendar reports its error and the others
   still sync (a warning mark in the sidebar, details in the log).
 - **Migration v10:** `sync_log`, `events.extra`, per-calendar last-sync status. **RPC:** `calendar.remote/link/unlink/sync`,
-  `sync.log`, `sync.log_clear`. `MAILCORE_CALDAV_URL` points CalDAV at another server (tests, self-hosting).
+  `sync.log`, `sync.log_clear`. `STEAD_CALDAV_URL` points CalDAV at another server (tests, self-hosting).
 - **Not done:** editing one occurrence of a series (Google "this event only" changes are reported as skipped), moving
   an event between calendars, reminders, read-only detection for shared iCloud calendars (a refused write shows in the
   log), a push that loses a race (reconciled on the next sync with the server winning), macOS.
@@ -97,7 +99,7 @@ two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
   Files over 5 MB or 5000 events are refused; broken events are skipped with a reason, never fatal.
 - **Conflict warnings, never blocks.** Adding or accepting an event shows what it overlaps (all-day banners and
   cancelled events do not count). The AI proposal card shows the same warning before you click Add.
-- **CLI:** `mailcore cal list | new | add | agenda | rm | conflicts | import | export`.
+- **CLI:** `stead cal list | new | add | agenda | rm | conflicts | import | export`.
   **RPC:** `calendar.list/create/update/delete/range/conflicts/export/import`, `event.get/create/update/delete`.
 - **GUI:** a Mail / Calendar switch in the sidebar. Month, week, day and agenda views; overlapping events sit side by
   side; a live "now" line; create and edit dialog with repeat presets, time zone, guests and a live overlap warning;
@@ -112,7 +114,7 @@ two-way sync with remote-wins conflict policy; AUR packaging first; MIT.
 
 ## Phase 4 (AI layer) — what exists
 
-Off until you turn it on (`mailcore ai enable`, or Settings → AI). Everything it produces is a proposal.
+Off until you turn it on (`stead ai enable`, or Settings → AI). Everything it produces is a proposal.
 
 - **Triage**: category (conversation, scheduling, transaction, notification, newsletter, other), needs-reply,
   urgency and a one-line summary, shown in the list and the reading pane. Mail you wrote yourself, or that
@@ -130,11 +132,11 @@ Off until you turn it on (`mailcore ai enable`, or Settings → AI). Everything 
   the user") are detected deterministically, never shown to a model, labelled by code, and the user is warned.
   Model output is validated against fixed vocabularies, and rules a model cannot be trusted with are enforced
   in code.
-- **Audit**: every model call is logged by size only; Settings → AI and `mailcore ai audit` show what left.
-- **Evaluation**: `mailcore ai eval` scores a model on 39 tuning cases; `--holdout` uses 14 cases never tuned
+- **Audit**: every model call is logged by size only; Settings → AI and `stead ai audit` show what left.
+- **Evaluation**: `stead ai eval` scores a model on 39 tuning cases; `--holdout` uses 14 cases never tuned
   against; `--no-guards` measures the model alone. qwen3:8b on the RTX 5060: holdout triage 87.5%, reply flag
   100%, event recall 100% / precision 80%, injection 3/3; about 1 s per call warm.
-- Commands: `mailcore ai status|enable|disable|set|key|analyze|triage|proposals|accept|dismiss|calendar|draft|audit|eval`.
+- Commands: `stead ai status|enable|disable|set|key|analyze|triage|proposals|accept|dismiss|calendar|draft|audit|eval`.
 - Not verified live: cloud calls (no API key was available), only fake-server tests cover that path.
 
 ## Phase 3 (desktop GUI) — what exists
@@ -142,7 +144,7 @@ Off until you turn it on (`mailcore ai enable`, or Settings → AI). Everything 
 - Three-pane dark UI (Svelte 5): accounts and folders with server unread counts, message list with
   search, reading pane. Keyboard first: `j`/`k` move, `c` compose, `r` reply, `u` read/unread, `s` star,
   `/` search, `g i` inbox, `?` help, `Esc` closes dialogs
-- HTML mail is sanitised in Rust (`mailcore::html`: scripts, forms, frames, dangerous URLs and risky CSS
+- HTML mail is sanitised in Rust (`stead::html`: scripts, forms, frames, dangerous URLs and risky CSS
   removed), then shown in a script-free sandboxed frame under its own CSP. Remote images are blocked
   until you load them for one message; the banner says how many were blocked
 - Compose and reply (threading headers, quoted text, attachments, Cc/Bcc) through the outbox, with a
@@ -161,66 +163,66 @@ Tests: 64 Rust (core, sanitiser attack vectors, flags, paging) and 30 UI logic t
 
 - Incremental IMAP sync: first pass pulls the newest N, later passes fetch only new UIDs, one
   flags fetch over the cached range detects flag changes and expunges, UIDVALIDITY resets the cache
-- `mailcore sync --backfill N` walks older mail in batches; `mailcore watch` keeps an IDLE
+- `stead sync --backfill N` walks older mail in batches; `stead watch` keeps an IDLE
   connection open and re-syncs on every push, reconnecting with backoff
-- `mailcore show ACCOUNT UID` downloads one body (PEEK, so it never marks mail as read), parses
+- `stead show ACCOUNT UID` downloads one body (PEEK, so it never marks mail as read), parses
   MIME text, HTML and attachment metadata, and caches it
-- `mailcore search QUERY` is FTS5 full text over cached subjects, addresses and downloaded bodies
-- Conversation threading from In-Reply-To/References (`mailcore thread`), stable under any
+- `stead search QUERY` is FTS5 full text over cached subjects, addresses and downloaded bodies
+- Conversation threading from In-Reply-To/References (`stead thread`), stable under any
   arrival order; schema v4
-- Outbox: `mailcore send` builds the message once (To/Cc/Bcc, reply headers, attachments), stores it,
+- Outbox: `stead send` builds the message once (To/Cc/Bcc, reply headers, attachments), stores it,
   and delivers; temporary failures retry at 1 min, 5 min, 15 min, 1 h, 6 h, 12 h, 24 h and give up after
-  8 attempts, while rejections and bad credentials fail at once. `mailcore outbox list|flush|run|retry|cancel`;
+  8 attempts, while rejections and bad credentials fail at once. `stead outbox list|flush|run|retry|cancel`;
   the daemon (`serve --socket`) flushes every 30 s. Bcc never appears in the message. Attachments are
   read when queued. Claiming an item before sending stops two processes double-sending.
-- `mailcore attachment ACCOUNT UID INDEX --dir D` saves an attachment with a sanitised name and
-  never overwrites; `mailcore sync ACCOUNT --all` covers every folder except Trash, Junk, All Mail and
+- `stead attachment ACCOUNT UID INDEX --dir D` saves an attachment with a sanitised name and
+  never overwrites; `stead sync ACCOUNT --all` covers every folder except Trash, Junk, All Mail and
   virtual views
 - Not yet: copying sent mail into the Sent folder (Gmail does it itself; iCloud does not), watching
   several folders at once, POP3 (deprioritised)
 
 ## Phase 1 (auth + daemon) — what exists
 
-- `mailcore account test` now checks IMAP and SMTP logins; `mailcore send` sends plain text
-- `mailcore caldav ACCOUNT` discovers CalDAV calendars (iCloud reuses the app-specific password)
-- `mailcore google configure|login|accounts|calendars|logout`: OAuth2 PKCE with a loopback
+- `stead account test` now checks IMAP and SMTP logins; `stead send` sends plain text
+- `stead caldav ACCOUNT` discovers CalDAV calendars (iCloud reuses the app-specific password)
+- `stead google configure|login|accounts|calendars|logout`: OAuth2 PKCE with a loopback
   redirect, Calendar scopes only (no CASA audit), refresh token kept in the secret store
-- `mailcore serve --socket` runs the JSON-RPC daemon on `$XDG_RUNTIME_DIR/mailcore.sock` (mode 0600)
+- `stead serve --socket` runs the JSON-RPC daemon on `$XDG_RUNTIME_DIR/stead.sock` (mode 0600)
 - SQLite schema v2 adds `oauth_identities`; migrations are applied in order on open
 
 Google setup: Google Cloud Console → create a *Desktop app* OAuth client, enable the Google
 Calendar API, add yourself as a test user, then
-`mailcore google configure --client-id ID --client-secret-stdin` and `mailcore google login`.
+`stead google configure --client-id ID --client-secret-stdin` and `stead google login`.
 Note: apps in Testing mode have refresh tokens that expire after 7 days.
 
 ## Phase 0 (spike) — what exists
 
-- `mailcore account add|list|remove|test`, `mailcore sync`, `mailcore messages`, `mailcore serve`
+- `stead account add|list|remove|test`, `stead sync`, `stead messages`, `stead serve`
 - IMAP over rustls: LOGIN, LIST, SELECT, FETCH of newest N headers; UIDVALIDITY reset handling
 - SQLite schema v1 (accounts, mailboxes, messages) with WAL
-- Secrets: OS keyring, fallback to ChaCha20-Poly1305 + Argon2id file (`MAILCORE_SECRETS=file`)
+- Secrets: OS keyring, fallback to ChaCha20-Poly1305 + Argon2id file (`STEAD_SECRETS=file`)
 - Tauri window with a diagnostics panel proving WebKitGTK renders on Wayland + Nvidia
 
 ## Run
 
 ```sh
 # core + CLI
-cargo test -p mailcore
-cargo run -p mailcore-cli -- ping
-cargo run -p mailcore-cli -- account add --name icloud --email you@icloud.com --provider icloud
-cargo run -p mailcore-cli -- account test icloud
-cargo run -p mailcore-cli -- sync icloud --limit 50
-cargo run -p mailcore-cli -- messages icloud
+cargo test -p stead
+cargo run -p stead-cli -- ping
+cargo run -p stead-cli -- account add --name icloud --email you@icloud.com --provider icloud
+cargo run -p stead-cli -- account test icloud
+cargo run -p stead-cli -- sync icloud --limit 50
+cargo run -p stead-cli -- messages icloud
 
 # JSON-RPC daemon
-echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | cargo run -q -p mailcore-cli -- serve
+echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | cargo run -q -p stead-cli -- serve
 
 # desktop shell
 cd apps/desktop && npm install && npm run tauri dev
 ```
 
-Environment knobs: `MAILCORE_DATA_DIR`, `MAILCORE_SECRETS=keyring|file`, `MAILCORE_PASSPHRASE`,
-`RUST_LOG=mailcore=debug`.
+Environment knobs: `STEAD_DATA_DIR`, `STEAD_SECRETS=keyring|file`, `STEAD_PASSPHRASE`,
+`RUST_LOG=stead=debug`.
 
 ## Linux graphics notes
 

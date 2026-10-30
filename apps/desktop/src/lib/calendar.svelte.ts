@@ -7,7 +7,7 @@ import type { CalEvent, CalSyncReport, Calendar, EventInput, Occurrence, RemoteL
 /** How often linked calendars sync while the app is open. */
 const AUTO_SYNC_MS = 5 * 60 * 1000;
 
-const PREFS_KEY = "mailcore.calendar";
+const PREFS_KEY = "stead.calendar";
 
 interface CalPrefs {
   view: CalView;

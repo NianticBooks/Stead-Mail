@@ -9,10 +9,10 @@ fn main() {
 /// WebKitGTK on Wayland + the proprietary Nvidia driver aborts with "Error 71 (Protocol error)
 /// dispatching to Wayland display" unless explicit sync is disabled. Verified on this project's
 /// reference machine (RTX 5060, driver 615, Hyprland) on 2026-10-27. Must run before any GTK
-/// initialisation, hence `main` and not `lib::run`. Set `MAILCORE_NO_GFX_WORKAROUND=1` to opt out.
+/// initialisation, hence `main` and not `lib::run`. Set `STEAD_NO_GFX_WORKAROUND=1` to opt out.
 #[cfg(target_os = "linux")]
 fn linux_graphics_workarounds() {
-    if std::env::var_os("MAILCORE_NO_GFX_WORKAROUND").is_some() {
+    if std::env::var_os("STEAD_NO_GFX_WORKAROUND").is_some() {
         return;
     }
     let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();

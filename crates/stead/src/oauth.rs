@@ -127,10 +127,10 @@ pub fn parse_callback(target: &str) -> std::result::Result<(String, String), Str
     }
 }
 
-const CALLBACK_HTML: &str = "<!doctype html><html><head><meta charset=utf-8><title>Mailcore</title>\
+const CALLBACK_HTML: &str = "<!doctype html><html><head><meta charset=utf-8><title>Stead</title>\
 <style>body{background:#0f1115;color:#e6e9ef;font-family:system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0}\
 div{text-align:center}h1{font-weight:600}p{color:#aab2c0}</style></head><body><div><h1>Signed in</h1>\
-<p>Mailcore received the authorization. You can close this tab.</p></div></body></html>";
+<p>Stead received the authorization. You can close this tab.</p></div></body></html>";
 
 /// Run the whole flow: start a loopback listener, hand the authorization URL to `present`
 /// (print it, open a browser), wait for the redirect, verify state, exchange the code.

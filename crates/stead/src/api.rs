@@ -1,4 +1,4 @@
-//! The single public surface of mailcore. Everything a UI, CLI or agent can do goes through
+//! The single public surface of stead. Everything a UI, CLI or agent can do goes through
 //! [`Api`]; the JSON-RPC layer in [`crate::rpc`] is a thin serialiser over these methods.
 
 use std::path::PathBuf;
@@ -265,7 +265,7 @@ pub struct SyncReport {
 impl Api {
     pub fn new(store: Store, secrets: Box<dyn SecretStore>, data_dir: PathBuf) -> Api {
         let http = crate::http_client();
-        Api { store: Mutex::new(store), secrets, data_dir, http, google_endpoints: GoogleEndpoints::default(), smtp_transport: smtp::Transport::Tls, llm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)), anthropic_url: crate::ai::llm::ANTHROPIC_URL.to_string(), caldav_base: std::env::var("MAILCORE_CALDAV_URL").ok().filter(|u| !u.is_empty()), sync_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())) }
+        Api { store: Mutex::new(store), secrets, data_dir, http, google_endpoints: GoogleEndpoints::default(), smtp_transport: smtp::Transport::Tls, llm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)), anthropic_url: crate::ai::llm::ANTHROPIC_URL.to_string(), caldav_base: std::env::var("STEAD_CALDAV_URL").ok().filter(|u| !u.is_empty()), sync_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     /// Point the cloud model at a different host (tests).
@@ -305,7 +305,7 @@ impl Api {
 
     pub fn ping(&self) -> Result<PingInfo> {
         Ok(PingInfo {
-            name: "mailcore",
+            name: "stead",
             version: env!("CARGO_PKG_VERSION"),
             data_dir: self.data_dir.display().to_string(),
             secrets_backend: self.secrets.backend_name(),
@@ -612,7 +612,7 @@ impl Api {
         let base = match (&self.caldav_base, account.provider) {
             (Some(b), _) => b.clone(),
             (None, Provider::Icloud) => caldav::ICLOUD_CALDAV.to_string(),
-            (None, _) => std::env::var("MAILCORE_CALDAV_URL").map_err(|_| Error::Invalid("set MAILCORE_CALDAV_URL for non-iCloud CalDAV accounts".into()))?,
+            (None, _) => std::env::var("STEAD_CALDAV_URL").map_err(|_| Error::Invalid("set STEAD_CALDAV_URL for non-iCloud CalDAV accounts".into()))?,
         };
         CalDavClient::new(&base, &account.email, password)
     }
@@ -639,15 +639,15 @@ impl Api {
 
     /// Environment variables win over the stored client.
     pub fn google_client_config(&self) -> Result<ClientConfig> {
-        if let Ok(id) = std::env::var("MAILCORE_GOOGLE_CLIENT_ID") {
+        if let Ok(id) = std::env::var("STEAD_GOOGLE_CLIENT_ID") {
             if !id.is_empty() {
-                return Ok(ClientConfig { client_id: id, client_secret: std::env::var("MAILCORE_GOOGLE_CLIENT_SECRET").ok().filter(|s| !s.is_empty()) });
+                return Ok(ClientConfig { client_id: id, client_secret: std::env::var("STEAD_GOOGLE_CLIENT_SECRET").ok().filter(|s| !s.is_empty()) });
             }
         }
         match self.secrets.get(GOOGLE_CLIENT_SECRET_KEY)? {
             Some(json) => serde_json::from_str(&json).map_err(|e| Error::Secrets(format!("stored google client is corrupt: {e}"))),
             None => Err(Error::Invalid(
-                "no Google OAuth client configured. In Google Cloud Console create a 'Desktop app' OAuth client, enable the Google Calendar API and add yourself as a test user, then run: mailcore google configure --client-id ID --client-secret SECRET".into(),
+                "no Google OAuth client configured. In Google Cloud Console create a 'Desktop app' OAuth client, enable the Google Calendar API and add yourself as a test user, then run: stead google configure --client-id ID --client-secret SECRET".into(),
             )),
         }
     }
@@ -1165,7 +1165,7 @@ mod tests {
     use crate::secrets::EncryptedFileStore;
 
     fn test_api() -> (Api, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("mailcore-api-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stead-api-{}", uuid::Uuid::new_v4()));
         let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("secrets.enc.json"), "pw").unwrap();
         (Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir.clone()), dir)
     }

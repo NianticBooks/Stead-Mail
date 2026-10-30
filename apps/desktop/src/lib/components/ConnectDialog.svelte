@@ -72,7 +72,7 @@
       {/each}
       {#each cal.remote?.errors ?? [] as e}<div class="problem" role="alert">{e}</div>{/each}
       {#if cal.remote && groups.length === 0 && cal.remote.errors.length === 0}
-        <p class="muted">No Google or iCloud accounts yet. Add one in Settings, or with <code>mailcore google login</code>.</p>
+        <p class="muted">No Google or iCloud accounts yet. Add one in Settings, or with <code>stead google login</code>.</p>
       {/if}
       {#if error}<div class="problem" role="alert">{error}</div>{/if}
     </div>

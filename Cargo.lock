@@ -1083,9 +1083,9 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
- "mailcore",
  "serde",
  "serde_json",
+ "stead",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -2643,62 +2643,6 @@ dependencies = [
  "smtp-proto",
  "tokio",
  "tokio-rustls",
-]
-
-[[package]]
-name = "mailcore"
-version = "0.1.0"
-dependencies = [
- "ammonia",
- "anyhow",
- "argon2",
- "async-imap",
- "base64 0.23.1",
- "chacha20poly1305",
- "chrono",
- "chrono-tz",
- "directories",
- "futures-util",
- "getrandom 0.3.4",
- "iana-time-zone",
- "keyring",
- "mail-parser",
- "mail-send",
- "open",
- "regex",
- "reqwest",
- "roxmltree",
- "rpassword",
- "rrule",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tracing",
- "url",
- "uuid",
- "webpki-roots",
-]
-
-[[package]]
-name = "mailcore-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "mailcore",
- "open",
- "rpassword",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4472,6 +4416,62 @@ name = "static_vcruntime"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff7589a1859b09232522bb9edf076ca7fcf14ded96685d3fa629db73023ffbb7"
+
+[[package]]
+name = "stead"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "anyhow",
+ "argon2",
+ "async-imap",
+ "base64 0.23.1",
+ "chacha20poly1305",
+ "chrono",
+ "chrono-tz",
+ "directories",
+ "futures-util",
+ "getrandom 0.3.4",
+ "iana-time-zone",
+ "keyring",
+ "mail-parser",
+ "mail-send",
+ "open",
+ "regex",
+ "reqwest",
+ "roxmltree",
+ "rpassword",
+ "rrule",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "url",
+ "uuid",
+ "webpki-roots",
+]
+
+[[package]]
+name = "stead-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "open",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "stead",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "stop-token"

@@ -1,12 +1,12 @@
-//! `mailcore` — CLI for the core, and the JSON-RPC daemon (`mailcore serve`).
+//! `stead` — CLI for the core, and the JSON-RPC daemon (`stead serve`).
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use mailcore::api::AddAccountRequest;
-use mailcore::{Api, Provider};
+use stead::api::AddAccountRequest;
+use stead::{Api, Provider};
 
 #[derive(Parser)]
-#[command(name = "mailcore", version, about = "AI-native mail + calendar core")]
+#[command(name = "stead", version, about = "AI-native mail + calendar core")]
 struct Cli {
     /// Emit machine-readable JSON instead of tables.
     #[arg(long, global = true)]
@@ -153,7 +153,7 @@ enum Cmd {
     },
     /// Run the JSON-RPC 2.0 daemon: on stdio by default, or on a Unix socket with --socket.
     Serve {
-        /// Listen on the default Unix socket ($XDG_RUNTIME_DIR/mailcore.sock) instead of stdio.
+        /// Listen on the default Unix socket ($XDG_RUNTIME_DIR/stead.sock) instead of stdio.
         #[arg(long)]
         socket: bool,
         /// Listen on this Unix socket path instead of stdio.
@@ -461,15 +461,15 @@ struct AddArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("mailcore=info".parse()?))
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("stead=info".parse()?))
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let api = Api::open_default().context("opening mailcore data")?;
+    let api = Api::open_default().context("opening stead data")?;
 
     match cli.cmd {
         Cmd::Ping => out(cli.json, &api.ping()?, |p| {
-            println!("mailcore {}  data: {}  secrets: {}  accounts: {}", p.version, p.data_dir, p.secrets_backend, p.accounts)
+            println!("stead {}  data: {}  secrets: {}  accounts: {}", p.version, p.data_dir, p.secrets_backend, p.accounts)
         }),
         Cmd::Account { cmd } => match cmd {
             AccountCmd::Add(a) => {
@@ -496,7 +496,7 @@ async fn main() -> Result<()> {
             }
             AccountCmd::List => out(cli.json, &api.list_accounts()?, |list| {
                 if list.is_empty() {
-                    println!("no accounts. add one with: mailcore account add --name NAME --email EMAIL --provider icloud|gmail|custom");
+                    println!("no accounts. add one with: stead account add --name NAME --email EMAIL --provider icloud|gmail|custom");
                 }
                 for a in list {
                     println!("{:<12} {:<32} {:>7}  imap {}:{}", a.name, a.email, format!("{:?}", a.provider).to_lowercase(), a.imap.host, a.imap.port);
@@ -520,7 +520,7 @@ async fn main() -> Result<()> {
             }
         }),
         Cmd::Sync { account, mailbox, limit, backfill, all } => {
-            let opts = mailcore::sync::SyncOptions { initial_limit: limit, backfill };
+            let opts = stead::sync::SyncOptions { initial_limit: limit, backfill };
             if all {
                 out(cli.json, &api.sync_all(&account, opts).await?, |r| {
                     for x in &r.reports {
@@ -568,7 +568,7 @@ async fn main() -> Result<()> {
         }),
         Cmd::Watch { account, mailbox, limit, idle_minutes, cycles } => {
             eprintln!("watching {account}/{mailbox} (Ctrl-C to stop)");
-            let opts = mailcore::sync::SyncOptions { initial_limit: limit, backfill: 0 };
+            let opts = stead::sync::SyncOptions { initial_limit: limit, backfill: 0 };
             let json = cli.json;
             api.watch(
                 &account,
@@ -602,7 +602,7 @@ async fn main() -> Result<()> {
             } else {
                 body
             };
-            let req = mailcore::api::SendRequest { account, to, cc, bcc, subject, body, in_reply_to, references, attachments: attach };
+            let req = stead::api::SendRequest { account, to, cc, bcc, subject, body, in_reply_to, references, attachments: attach };
             if queue_only {
                 out(cli.json, &api.outbox_enqueue(req)?, |i| println!("queued {} ({} bytes) to {}", short(&i.id), i.size, i.rcpts.join(", ")))
             } else {
@@ -677,7 +677,7 @@ async fn main() -> Result<()> {
                     client_secret
                 }
                 .filter(|s| !s.is_empty());
-                api.google_configure(mailcore::google::ClientConfig { client_id, client_secret: secret })?;
+                api.google_configure(stead::google::ClientConfig { client_id, client_secret: secret })?;
                 println!("Google OAuth client stored in the secret store.");
             }
             GoogleCmd::Login { no_browser } => {
@@ -693,7 +693,7 @@ async fn main() -> Result<()> {
             }
             GoogleCmd::Accounts => out(cli.json, &api.google_identities()?, |l| {
                 if l.is_empty() {
-                    println!("no Google accounts. run: mailcore google login");
+                    println!("no Google accounts. run: stead google login");
                 }
                 for i in l {
                     println!("{:<32} id {}", i.email, i.id);
@@ -709,11 +709,11 @@ async fn main() -> Result<()> {
         Cmd::Cal { cmd } => cal_command(&api, cmd, cli.json).await?,
         Cmd::Ai { cmd } => ai_command(&api, cmd, cli.json).await?,
         Cmd::Serve { socket, socket_path } => {
-            let path = socket_path.or_else(|| socket.then(mailcore::socket_path));
+            let path = socket_path.or_else(|| socket.then(stead::socket_path));
             match path {
-                None => mailcore::rpc::serve_stdio(&api).await?,
+                None => stead::rpc::serve_stdio(&api).await?,
                 Some(p) => {
-                    eprintln!("mailcore daemon listening on {}", p.display());
+                    eprintln!("stead daemon listening on {}", p.display());
                     let api = std::sync::Arc::new(api);
                     // The daemon is long-lived, so it is the natural owner of outbox retries.
                     let flusher = api.clone();
@@ -727,7 +727,7 @@ async fn main() -> Result<()> {
                             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                         }
                     });
-                    mailcore::rpc::serve_unix(api, &p).await?
+                    stead::rpc::serve_unix(api, &p).await?
                 }
             }
         }
@@ -735,20 +735,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_provider(s: &str) -> Result<mailcore::ai::Provider> {
+fn parse_provider(s: &str) -> Result<stead::ai::Provider> {
     match s.to_ascii_lowercase().as_str() {
-        "local" => Ok(mailcore::ai::Provider::Local),
-        "cloud" => Ok(mailcore::ai::Provider::Cloud),
+        "local" => Ok(stead::ai::Provider::Local),
+        "cloud" => Ok(stead::ai::Provider::Cloud),
         other => anyhow::bail!("unknown provider '{other}' (use local or cloud)"),
     }
 }
 
-fn fmt_ratio(r: mailcore::ai::eval::Ratio) -> String {
+fn fmt_ratio(r: stead::ai::eval::Ratio) -> String {
     format!("{:>5.1}%  ({}/{})", r.pct(), r.good, r.total)
 }
 
 async fn ai_command(api: &Api, cmd: AiCmd, json: bool) -> Result<()> {
-    use mailcore::ai::Provider;
+    use stead::ai::Provider;
     match cmd {
         AiCmd::Status => okout(json, &api.ai_status().await?, |s| {
             let c = &s.config;
@@ -793,7 +793,7 @@ async fn ai_command(api: &Api, cmd: AiCmd, json: bool) -> Result<()> {
             let mut k = String::new();
             std::io::stdin().read_line(&mut k)?;
             api.ai_set_cloud_key(k.trim())?;
-            println!("API key stored in the system keyring. Cloud models still stay off until: mailcore ai set --cloud on");
+            println!("API key stored in the system keyring. Cloud models still stay off until: stead ai set --cloud on");
             Ok(())
         }
         AiCmd::Key { cmd: KeyCmd::Clear } => {
@@ -834,7 +834,7 @@ async fn ai_command(api: &Api, cmd: AiCmd, json: bool) -> Result<()> {
         }),
         AiCmd::Draft { account, uid, mailbox, instruction, provider, confirm } => {
             let provider = provider.map(|p| parse_provider(&p)).transpose()?;
-            let req = mailcore::ai::pipeline::DraftRequest { account, mailbox, uid, instruction, existing_draft: String::new(), provider, confirm_hash: confirm.clone() };
+            let req = stead::ai::pipeline::DraftRequest { account, mailbox, uid, instruction, existing_draft: String::new(), provider, confirm_hash: confirm.clone() };
             if provider == Some(Provider::Cloud) && confirm.is_none() {
                 match api.ai_draft_preview(&req).await? {
                     Some(p) => {
@@ -855,8 +855,8 @@ async fn ai_command(api: &Api, cmd: AiCmd, json: bool) -> Result<()> {
         }),
         AiCmd::Eval { provider, model, only, cases, verbose, no_guards, holdout } => {
             let cases = match cases {
-                None if holdout => Some(mailcore::ai::eval::holdout_cases()),
-                Some(path) => Some(std::fs::read_to_string(&path)?.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<std::result::Result<Vec<mailcore::ai::eval::Case>, _>>()?),
+                None if holdout => Some(stead::ai::eval::holdout_cases()),
+                Some(path) => Some(std::fs::read_to_string(&path)?.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<std::result::Result<Vec<stead::ai::eval::Case>, _>>()?),
                 None => None,
             };
             let provider = parse_provider(&provider)?;
@@ -890,7 +890,7 @@ fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-fn fmt_sync(r: &mailcore::api::SyncReport) -> String {
+fn fmt_sync(r: &stead::api::SyncReport) -> String {
     format!(
         "{}/{}: {} on server, {} cached | new {} flags {} expunged {} backfilled {}{}",
         r.account, r.mailbox, r.exists, r.cached_total, r.stored, r.flags_updated, r.expunged, r.backfilled,
@@ -911,7 +911,7 @@ fn fmt_opt<T: std::fmt::Display>(v: Option<T>) -> String {
 }
 
 async fn cal_command(api: &Api, cmd: CalCmd, json: bool) -> anyhow::Result<()> {
-    use mailcore::calendar::EventInput;
+    use stead::calendar::EventInput;
     match cmd {
         CalCmd::List => okout(json, &api.calendars()?, |l| {
             for c in l {
@@ -933,7 +933,7 @@ async fn cal_command(api: &Api, cmd: CalCmd, json: bool) -> anyhow::Result<()> {
                 eprintln!("could not list: {e}");
             }
             if l.calendars.is_empty() && l.errors.is_empty() {
-                println!("no Google or iCloud accounts. add one with: mailcore google login / mailcore account add");
+                println!("no Google or iCloud accounts. add one with: stead google login / stead account add");
             }
         }),
         CalCmd::Link { name, account } => {
@@ -945,11 +945,11 @@ async fn cal_command(api: &Api, cmd: CalCmd, json: bool) -> anyhow::Result<()> {
                 .collect();
             let c = match hits.as_slice() {
                 [one] => *one,
-                [] => anyhow::bail!("no calendar named '{name}' (see: mailcore cal remote)"),
+                [] => anyhow::bail!("no calendar named '{name}' (see: stead cal remote)"),
                 many => anyhow::bail!("{} calendars are named '{name}'; add --account ({})", many.len(), many.iter().map(|c| c.account.as_str()).collect::<Vec<_>>().join(", ")),
             };
             let cal = api.calendar_link(&c.source, &c.account_id, &c.remote_id).await?;
-            okout(json, &cal, |c| println!("linked {} ({}). run: mailcore cal sync", c.name, c.id))
+            okout(json, &cal, |c| println!("linked {} ({}). run: stead cal sync", c.name, c.id))
         }
         CalCmd::Unlink { calendar } => {
             let id = api.calendars()?.into_iter().find(|c| c.id == calendar || c.name.eq_ignore_ascii_case(&calendar)).map(|c| c.id).ok_or_else(|| anyhow::anyhow!("no calendar '{calendar}'"))?;
@@ -963,7 +963,7 @@ async fn cal_command(api: &Api, cmd: CalCmd, json: bool) -> anyhow::Result<()> {
             };
             okout(json, &api.calendar_sync(id.as_deref()).await?, |l| {
                 if l.is_empty() {
-                    println!("no linked calendars. see: mailcore cal remote");
+                    println!("no linked calendars. see: stead cal remote");
                 }
                 for r in l {
                     println!("{}: {} pulled, {} removed, {} sent, {} conflict(s)", r.calendar, r.pulled, r.removed, r.pushed, r.conflicts);

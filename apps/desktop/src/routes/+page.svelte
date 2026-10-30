@@ -133,7 +133,7 @@
 </script>
 
 <svelte:window {onkeydown} />
-<svelte:head><title>{app.currentMailbox?.unseen ? `(${app.currentMailbox.unseen}) ` : ""}Mailcore</title></svelte:head>
+<svelte:head><title>{app.currentMailbox?.unseen ? `(${app.currentMailbox.unseen}) ` : ""}Stead</title></svelte:head>
 
 <div class="shell" class:cal={app.view === "calendar"} inert={overlayOpen}>
   <Sidebar />

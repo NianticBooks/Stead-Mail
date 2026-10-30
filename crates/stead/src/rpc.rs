@@ -605,14 +605,14 @@ mod tests {
 
     #[tokio::test]
     async fn ping_and_unknown_method() {
-        let dir = std::env::temp_dir().join(format!("mailcore-rpc-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stead-rpc-{}", uuid::Uuid::new_v4()));
         let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("s.json"), "pw").unwrap();
         let api = Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir.clone());
 
         let req: Request = serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
         let resp = dispatch(&api, req).await;
         assert_eq!(resp.id, json!(1));
-        assert_eq!(resp.result.unwrap()["name"], "mailcore");
+        assert_eq!(resp.result.unwrap()["name"], "stead");
 
         let req: Request = serde_json::from_str(r#"{"jsonrpc":"2.0","id":"x","method":"nope"}"#).unwrap();
         let resp = dispatch(&api, req).await;
@@ -629,7 +629,7 @@ mod tests {
     async fn unix_socket_serves_concurrent_clients_and_is_private() {
         use std::os::unix::fs::PermissionsExt;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let dir = std::env::temp_dir().join(format!("mailcore-sock-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stead-sock-{}", uuid::Uuid::new_v4()));
         let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("s.json"), "pw").unwrap();
         let api = std::sync::Arc::new(Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir.clone()));
         let sock = dir.join("m.sock");
@@ -650,7 +650,7 @@ mod tests {
                 BufReader::new(&mut c).read_line(&mut line).await.unwrap();
                 let v: Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(v["id"], i);
-                assert_eq!(v["result"]["name"], "mailcore");
+                assert_eq!(v["result"]["name"], "stead");
             }));
         }
         for t in tasks { t.await.unwrap(); }
@@ -664,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn draft_methods_round_trip_over_rpc() {
-        let dir = std::env::temp_dir().join(format!("mailcore-rpc-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stead-rpc-{}", uuid::Uuid::new_v4()));
         let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("s.json"), "pw").unwrap();
         let api = Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir.clone());
         api.add_account(crate::api::AddAccountRequest {
@@ -688,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn calendar_methods_round_trip_over_rpc() {
-        let dir = std::env::temp_dir().join(format!("mailcore-rpc-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stead-rpc-{}", uuid::Uuid::new_v4()));
         let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("s.json"), "pw").unwrap();
         let api = Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir.clone());
         let call = |method: &str, params: serde_json::Value| {

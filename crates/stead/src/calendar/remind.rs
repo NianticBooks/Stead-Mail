@@ -118,7 +118,7 @@ mod tests {
     use crate::store::Store;
 
     fn api() -> (Api, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("mailcore-remind-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stead-remind-{}", uuid::Uuid::new_v4()));
         let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("s.json"), "pw").unwrap();
         (Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir.clone()), dir)
     }

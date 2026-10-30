@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=Mailcore
+Name=Stead
 GenericName=Mail and Calendar
-Comment=AI-native email and calendar client
-Exec=mailcore-desktop
-Icon=mailcore
+Comment=Your mail stays home. AI-native email and calendar client
+Exec=stead-desktop
+Icon=stead
 Terminal=false
 Categories=Network;Email;Office;Calendar;
 Keywords=email;mail;calendar;imap;

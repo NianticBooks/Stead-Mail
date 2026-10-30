@@ -498,7 +498,7 @@ mod tests {
     use crate::store::{OAuthIdentity, Store};
 
     fn test_api() -> Api {
-        let dir = std::env::temp_dir().join(format!("mailcore-sync-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stead-sync-{}", uuid::Uuid::new_v4()));
         let secrets = EncryptedFileStore::open_with_passphrase(&dir.join("secrets.enc.json"), "pw").unwrap();
         Api::new(Store::open_in_memory().unwrap(), Box::new(secrets), dir)
     }
@@ -1002,7 +1002,7 @@ mod tests {
     #[test]
     fn google_json_for_all_day_and_recurring_events() {
         let mut ev = Event {
-            id: "i".into(), calendar_id: "c".into(), uid: "u@mailcore".into(), title: "Trash".into(), description: None, location: None,
+            id: "i".into(), calendar_id: "c".into(), uid: "u@stead".into(), title: "Trash".into(), description: None, location: None,
             start_utc: "2026-11-02T06:00:00Z".into(), end_utc: "2026-11-03T06:00:00Z".into(), all_day: true, tz: Some("America/Chicago".into()),
             rrule: Some("FREQ=WEEKLY;BYDAY=MO".into()), exdates: vec!["2026-11-09T06:00:00Z".into()], status: "confirmed".into(), organizer: None,
             attendees: vec![], source_message_id: None, sequence: 3, updated_at: String::new(),
