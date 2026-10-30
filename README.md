@@ -280,7 +280,8 @@ if the Keychain cannot be used. `STEAD_DATA_DIR` moves the whole profile, which 
   `xattr -dr com.apple.quarantine Stead.app`. Notarization needs an Apple Developer Program membership, a "Developer ID
   Application" certificate as `bundle.macOS.signingIdentity`, and `APPLE_ID` + app-specific password + `APPLE_TEAM_ID`
   (or an App Store Connect API key) in the environment for `tauri build`.
-- The icons are still the default Tauri template. Replace `apps/desktop/src-tauri/icons/` (`npx tauri icon art.png`).
+- The icon is the "Gate" mark. To change it, put a square 1024 px PNG (transparent corners, about 10% margin) through
+  `npx tauri icon art.png` and keep the file names already in `apps/desktop/src-tauri/icons/`.
 - The bundle is arm64 only (no Intel or universal build).
 - The first time the app reads a Keychain item that another binary (for example the CLI) created, macOS may ask for access.
 - Reminders only fire while the app is running (hidden is fine, quit is not).
