@@ -19,6 +19,7 @@ pub mod rpc;
 pub mod secrets;
 pub mod smtp;
 pub mod sync;
+pub mod unsub;
 pub mod store;
 
 pub use account::{Account, AuthKind, Provider, ServerConfig};

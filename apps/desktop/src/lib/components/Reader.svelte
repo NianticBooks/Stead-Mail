@@ -45,6 +45,9 @@
           <button class="icon-btn" class:on={isStarred(d)} onclick={() => app.setStarred(d.uid, !isStarred(d))} title="Star (s)" aria-label="Star">
             <Icon name="star" fill={isStarred(d)} />
           </button>
+          <button class="icon-btn" class:on={app.prefs.assistant} onclick={() => app.setPref("assistant", !app.prefs.assistant)} title="Assistant (a)" aria-label="Show or hide the Assistant">
+            <Icon name="sparkles" />
+          </button>
           <button class="icon-btn" onclick={() => void app.deleteMessage()} title="Move to Trash (#)" aria-label="Move to Trash">
             <Icon name="trash" />
           </button>

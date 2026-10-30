@@ -5,6 +5,7 @@
   import Sidebar from "$lib/components/Sidebar.svelte";
   import MessageList from "$lib/components/MessageList.svelte";
   import Reader from "$lib/components/Reader.svelte";
+  import AssistantPanel from "$lib/components/AssistantPanel.svelte";
   import Compose from "$lib/components/Compose.svelte";
   import Settings from "$lib/components/Settings.svelte";
   import OutboxPanel from "$lib/components/OutboxPanel.svelte";
@@ -118,6 +119,9 @@
       case "s":
         if (app.detail) void app.setStarred(app.detail.uid, !isStarred(app.detail));
         break;
+      case "a":
+        app.setPref("assistant", !app.prefs.assistant);
+        break;
       case "#":
       case "Delete":
       case "Backspace":
@@ -147,11 +151,12 @@
 <svelte:window {onkeydown} />
 <svelte:head><title>{app.currentMailbox?.unseen ? `(${app.currentMailbox.unseen}) ` : ""}Stead</title></svelte:head>
 
-<div class="shell" class:cal={app.view === "calendar"} inert={overlayOpen}>
+<div class="shell" class:cal={app.view === "calendar"} class:assistant={app.view === "mail" && app.prefs.assistant} inert={overlayOpen}>
   <Sidebar />
   {#if app.view === "mail"}
     <MessageList bind:this={list} />
     <Reader />
+    {#if app.prefs.assistant}<AssistantPanel />{/if}
   {:else}
     <CalendarView />
   {/if}
@@ -171,5 +176,8 @@
 
 <style>
   .shell.cal { grid-template-columns: 212px minmax(0, 1fr); }
+  .shell.assistant { grid-template-columns: 212px minmax(270px, 340px) minmax(0, 1fr) 300px; }
+  /* Not enough room for four columns: the Assistant gives way, the message keeps its width. */
+  @media (max-width: 1180px) { .shell.assistant { grid-template-columns: 212px minmax(270px, 340px) minmax(0, 1fr); } .shell.assistant > :global(.assistant) { display: none; } }
   .shell { display: grid; grid-template-columns: 212px minmax(270px, 340px) minmax(0, 1fr); height: 100vh; }
 </style>

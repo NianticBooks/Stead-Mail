@@ -380,3 +380,36 @@ export interface DraftResult {
   model: string;
   millis: number;
 }
+
+/** A mailing list worth unsubscribing from. */
+export interface UnsubSuggestion {
+  sender: string;
+  name: string | null;
+  total: number;
+  unread: number;
+  last_date: string | null;
+  latest_uid: number;
+  latest_subject: string | null;
+  category: string | null;
+  one_click: boolean;
+  has_mailto: boolean;
+  has_link: boolean;
+}
+
+/** What the open message's sender offers. */
+export interface MessageUnsub {
+  sender: string;
+  name: string | null;
+  total: number;
+  one_click: boolean;
+  has_mailto: boolean;
+  has_link: boolean;
+  state: "unsubscribed" | "opened" | "dismissed" | null;
+}
+
+export interface UnsubOutcome {
+  sender: string;
+  method: "one_click" | "mailto" | "web";
+  url: string | null;
+  detail: string;
+}

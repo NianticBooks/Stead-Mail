@@ -7,7 +7,7 @@ import { isUnread } from "./format";
 import { folderEntries } from "./mailboxes";
 import type {
   Account, AddAccountInput, AiConfig, AiStatus, CloudPreview, EventProposal, MessageDetail, MessageRow, Mailbox, OutboxItem,
-  ProviderKind, SanitizedHtml, SearchHit, SyncReport,
+  ProviderKind, SanitizedHtml, SearchHit, SyncReport, UnsubSuggestion, MessageUnsub,
 } from "./types";
 
 const PAGE = 100;
@@ -49,15 +49,17 @@ export function splitReplyBody(body: string): { typed: string; quoted: string } 
 
 interface Prefs {
   markReadOnOpen: boolean;
+  /** The right-hand Assistant column. */
+  assistant: boolean;
 }
 
 const PREFS_KEY = "stead.prefs";
 
 function loadPrefs(): Prefs {
   try {
-    return { markReadOnOpen: true, ...JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}") };
+    return { markReadOnOpen: true, assistant: true, ...JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}") };
   } catch {
-    return { markReadOnOpen: true };
+    return { markReadOnOpen: true, assistant: true };
   }
 }
 
@@ -110,6 +112,14 @@ class App {
   /** Messages deleted but still within the undo window, as "mailboxId:uid". Hidden from the list. */
   hidden = $state<string[]>([]);
   #pendingDeletes = new Map<string, { account: string; mailbox: string; uid: number; timer: ReturnType<typeof setTimeout> }>();
+
+  /** Assistant column: mailing lists worth leaving, and what the open message's sender offers. */
+  unsub = $state<UnsubSuggestion[]>([]);
+  unsubLoading = $state(false);
+  unsubBusy = $state<string | null>(null);
+  messageUnsub = $state<MessageUnsub | null>(null);
+  #unsubToken = 0;
+  #infoToken = 0;
 
   #openToken = 0;
   #listToken = 0;
@@ -635,6 +645,74 @@ class App {
 
   setSeen = (uid: number, on: boolean) => this.#setFlag(uid, "seen", on);
   setStarred = (uid: number, on: boolean) => this.#setFlag(uid, "flagged", on);
+
+  // ---------------------------------------------------------------- unsubscribe
+
+  /** Read list headers of new mail, then rebuild the suggestions for this folder. */
+  async refreshUnsub() {
+    const account = this.accountId;
+    const mailbox = this.mailbox;
+    if (!account || !this.currentMailbox) return;
+    const token = ++this.#unsubToken;
+    this.unsubLoading = true;
+    try {
+      // Offline or refused: the suggestions already known are still shown.
+      await api.unsubScan(account, mailbox).catch(() => 0);
+      const list = await api.unsubSuggestions(account, mailbox);
+      if (token === this.#unsubToken) this.unsub = list;
+    } catch {
+      if (token === this.#unsubToken) this.unsub = [];
+    } finally {
+      if (token === this.#unsubToken) this.unsubLoading = false;
+    }
+  }
+
+  /** What the open message's sender offers (null when it is not a mailing list). */
+  async loadMessageUnsub() {
+    const d = this.detail;
+    const account = this.accountId;
+    if (!d || !account) {
+      this.messageUnsub = null;
+      return;
+    }
+    const token = ++this.#infoToken;
+    this.messageUnsub = null;
+    try {
+      const info = await api.unsubInfo(account, d.mailbox, d.uid);
+      if (token === this.#infoToken) this.messageUnsub = info;
+    } catch {
+      if (token === this.#infoToken) this.messageUnsub = null;
+    }
+  }
+
+  async unsubscribe(sender: string) {
+    const account = this.accountId;
+    if (!account || this.unsubBusy) return;
+    this.unsubBusy = sender;
+    try {
+      const out = await api.unsubRun(account, this.mailbox, sender);
+      if (out.method === "web" && out.url) await this.openLink(out.url);
+      this.toast("success", out.method === "web" ? `Opened ${sender}'s page. Confirm there to finish.` : `${sender}: ${out.detail}`);
+      this.unsub = this.unsub.filter((s) => s.sender !== sender);
+      if (this.messageUnsub?.sender === sender) this.messageUnsub = { ...this.messageUnsub, state: out.method === "web" ? "opened" : "unsubscribed" };
+    } catch (e) {
+      this.toast("error", `Could not unsubscribe from ${sender}: ${errText(e)}`);
+    } finally {
+      this.unsubBusy = null;
+    }
+  }
+
+  async dismissUnsub(sender: string) {
+    const account = this.accountId;
+    if (!account) return;
+    try {
+      await api.unsubDismiss(account, sender);
+      this.unsub = this.unsub.filter((s) => s.sender !== sender);
+      if (this.messageUnsub?.sender === sender) this.messageUnsub = { ...this.messageUnsub, state: "dismissed" };
+    } catch (e) {
+      this.toast("error", errText(e));
+    }
+  }
 
   // ---------------------------------------------------------------- delete
 

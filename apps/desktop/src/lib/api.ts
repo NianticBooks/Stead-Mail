@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Account, AddAccountInput, AiConfig, AiStatus, Analysis, AuditReport, CalEvent, CalSyncReport, Calendar, EventInput, RemoteList, SyncLogEntry, ImportReport, Occurrence, CloudPreview, DraftResult, EventProposal, ProviderKind, CalendarSummary, ConnectionReport, Mailbox, MessageDetail, MessageRow, OAuthIdentity,
-  Draft, OutboxItem, SanitizedHtml, SavedAttachment, SearchHit, SendOutcome, SyncReport,
+  Draft, OutboxItem, SanitizedHtml, SavedAttachment, SearchHit, SendOutcome, SyncReport, UnsubSuggestion, MessageUnsub, UnsubOutcome,
 } from "./types";
 
 /** One call into the core's JSON-RPC surface. Rejects with the core's own error message. */
@@ -47,6 +47,11 @@ export const api = {
     rpc<MessageRow>("message.set_flag", { account, mailbox, uid, flag, on }),
   deleteMessage: (account: string, mailbox: string, uid: number) =>
     rpc<{ mailbox: string; uid: number; trash: string }>("message.delete", { account, mailbox, uid }),
+  unsubScan: (account: string, mailbox: string) => rpc<number>("unsubscribe.scan", { account, mailbox }),
+  unsubSuggestions: (account: string, mailbox: string) => rpc<UnsubSuggestion[]>("unsubscribe.suggestions", { account, mailbox }),
+  unsubInfo: (account: string, mailbox: string, uid: number) => rpc<MessageUnsub | null>("unsubscribe.info", { account, mailbox, uid }),
+  unsubRun: (account: string, mailbox: string, sender: string) => rpc<UnsubOutcome>("unsubscribe.run", { account, mailbox, sender }),
+  unsubDismiss: (account: string, sender: string) => rpc<Record<string, never>>("unsubscribe.dismiss", { account, sender }),
   thread: (account: string, threadId: string) => rpc<MessageRow[]>("thread", { account, thread_id: threadId }),
   search: (query: string, account: string | undefined, limit: number) => rpc<SearchHit[]>("search", { query, account, limit }),
 

@@ -222,6 +222,23 @@ pub async fn fetch_flags_range<T: ImapStream>(session: &mut Session<T>, min: u32
         .collect())
 }
 
+/// The `List-Unsubscribe` and `List-Unsubscribe-Post` values of the given UIDs, read from the
+/// server without touching flags. A message without them comes back with two empty strings.
+pub async fn fetch_unsub_headers<T: ImapStream>(session: &mut Session<T>, uid_set: &str) -> Result<Vec<(u32, String, String)>> {
+    let fetches: Vec<Fetch> = session
+        .uid_fetch(uid_set, "(UID BODY.PEEK[HEADER.FIELDS (LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)])")
+        .await?
+        .try_collect()
+        .await?;
+    Ok(fetches
+        .iter()
+        .filter_map(|f| {
+            let (list, post) = f.header().map(crate::unsub::extract_headers).unwrap_or_default();
+            Some((f.uid?, list, post))
+        })
+        .collect())
+}
+
 /// `UID SEARCH <criteria>`, ascending.
 pub async fn search_uids<T: ImapStream>(session: &mut Session<T>, criteria: &str) -> Result<Vec<u32>> {
     let mut v: Vec<u32> = session.uid_search(criteria).await?.into_iter().collect();

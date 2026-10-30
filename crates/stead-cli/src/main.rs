@@ -58,6 +58,17 @@ enum Cmd {
         #[arg(long, default_value = "INBOX")]
         mailbox: String,
     },
+    /// Senders worth unsubscribing from (mailing lists with several messages), and the unsubscribe itself.
+    Unsubscribe {
+        account: String,
+        /// Sender address to unsubscribe from. Without it, list the suggestions.
+        sender: Option<String>,
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+        /// Stop suggesting this sender instead of unsubscribing.
+        #[arg(long, requires = "sender")]
+        dismiss: bool,
+    },
     /// Full-text search over cached subjects, addresses and downloaded bodies.
     Search {
         query: String,
@@ -561,6 +572,31 @@ async fn main() -> Result<()> {
         Cmd::Delete { account, uid, mailbox } => out(cli.json, &api.delete_message(&account, &mailbox, uid).await?, |d| {
             println!("moved {}/{} to {}", d.mailbox, d.uid, d.trash);
         }),
+        Cmd::Unsubscribe { account, sender: None, mailbox, .. } => {
+            api.unsubscribe_scan(&account, &mailbox, stead::unsub::SCAN_BATCH).await?;
+            out(cli.json, &api.unsubscribe_suggestions(&account, &mailbox)?, |l| {
+                if l.is_empty() {
+                    println!("no mailing lists to unsubscribe from");
+                }
+                for s in l {
+                    let how = if s.one_click { "one click" } else if s.has_mailto { "email" } else { "web page" };
+                    println!("{:<36} {:>4} msgs, {:>3} unread   {}", s.sender, s.total, s.unread, how);
+                }
+            });
+        }
+        Cmd::Unsubscribe { account, sender: Some(sender), mailbox, dismiss } => {
+            if dismiss {
+                api.unsubscribe_dismiss(&account, &sender)?;
+                println!("will not suggest {sender} again");
+            } else {
+                out(cli.json, &api.unsubscribe(&account, &mailbox, &sender).await?, |o| {
+                    println!("{}", o.detail);
+                    if let Some(u) = &o.url {
+                        println!("open: {u}");
+                    }
+                });
+            }
+        }
         Cmd::Search { query, account, limit } => out(cli.json, &api.search(&query, account.as_deref(), limit)?, |hits| {
             if hits.is_empty() {
                 println!("no matches (search covers cached headers and downloaded bodies; sync or `show` more mail)");

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, AuthKind, Provider, ServerConfig};
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE accounts (
@@ -342,6 +342,40 @@ CREATE INDEX events_by_remote ON events(calendar_id, remote_id);
 
 /// Triage can flag a message that tried to instruct an AI.
 const MIGRATION_V8: &str = "ALTER TABLE ai_triage ADD COLUMN suspicious INTEGER NOT NULL DEFAULT 0;";
+
+/// Mailing-list headers, read lazily from the server. A row means "looked": both values are
+/// empty strings for a message that offers no unsubscribe. `unsub_senders` remembers what was
+/// done about a sender so it stops being suggested.
+const MIGRATION_V13: &str = r#"
+CREATE TABLE message_unsub (
+    message_id        INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    list_unsubscribe  TEXT NOT NULL,
+    list_post         TEXT NOT NULL
+);
+CREATE TABLE unsub_senders (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    sender     TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    method     TEXT,
+    at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (account_id, sender)
+);
+"#;
+
+/// One cached message that offers an unsubscribe header, as the suggestions need it.
+#[derive(Debug, Clone)]
+pub struct UnsubRow {
+    pub message_id: i64,
+    pub uid: u32,
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub subject: Option<String>,
+    pub date: Option<String>,
+    pub flags: String,
+    pub category: Option<String>,
+    pub list_unsubscribe: String,
+    pub list_post: String,
+}
 
 /// An OAuth2 login (e.g. a Google account authorised for Calendar). The refresh token lives in
 /// the secret store under [`OAuthIdentity::refresh_secret_key`], never in SQLite.
@@ -701,6 +735,9 @@ impl Store {
         if version < 12 {
             tx.execute_batch(MIGRATION_V12)?;
         }
+        if version < 13 {
+            tx.execute_batch(MIGRATION_V13)?;
+        }
         if version < SCHEMA_VERSION {
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         }
@@ -1028,6 +1065,87 @@ impl Store {
             self.conn.execute("UPDATE mailboxes SET unseen = MAX(0, unseen - 1) WHERE id = ?1 AND unseen IS NOT NULL", [mailbox_id])?;
         }
         Ok(true)
+    }
+
+    // ----- unsubscribe -----
+
+    /// Newest cached messages whose list headers have not been read yet: `(message id, uid)`.
+    pub fn unscanned_for_unsub(&self, mailbox_id: i64, limit: usize) -> Result<Vec<(i64, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, uid FROM messages WHERE mailbox_id = ?1 AND from_addr IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM message_unsub WHERE message_id = messages.id)
+             ORDER BY uid DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![mailbox_id, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn has_unsub_row(&self, message_id: i64) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM message_unsub WHERE message_id = ?1)", [message_id], |r| r.get(0))?)
+    }
+
+    pub fn set_unsub_headers(&mut self, rows: &[(i64, String, String)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut ins = tx.prepare("INSERT OR REPLACE INTO message_unsub (message_id, list_unsubscribe, list_post) VALUES (?1,?2,?3)")?;
+            for (id, list, post) in rows {
+                ins.execute(params![id, list, post])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every cached message in the mailbox that offers an unsubscribe header.
+    pub fn unsub_rows(&self, mailbox_id: i64) -> Result<Vec<UnsubRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.uid, m.from_addr, m.from_name, m.subject, m.date, m.flags,
+                    (SELECT category FROM ai_triage WHERE message_id = m.id), u.list_unsubscribe, u.list_post
+             FROM messages m JOIN message_unsub u ON u.message_id = m.id
+             WHERE m.mailbox_id = ?1 AND m.from_addr IS NOT NULL AND u.list_unsubscribe != ''
+             ORDER BY COALESCE(m.date, m.internal_date) DESC, m.uid DESC",
+        )?;
+        let rows = stmt.query_map([mailbox_id], |r| {
+            Ok(UnsubRow {
+                message_id: r.get(0)?,
+                uid: r.get(1)?,
+                from_addr: r.get(2)?,
+                from_name: r.get(3)?,
+                subject: r.get(4)?,
+                date: r.get(5)?,
+                flags: r.get(6)?,
+                category: r.get(7)?,
+                list_unsubscribe: r.get(8)?,
+                list_post: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Total and unread cached messages per sender in a mailbox (lower-cased address).
+    pub fn sender_counts(&self, mailbox_id: i64) -> Result<std::collections::HashMap<String, (u32, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lower(from_addr), COUNT(*), SUM(CASE WHEN (' ' || flags || ' ') LIKE '% \\Seen %' THEN 0 ELSE 1 END)
+             FROM messages WHERE mailbox_id = ?1 AND from_addr IS NOT NULL GROUP BY lower(from_addr)",
+        )?;
+        let rows = stmt.query_map([mailbox_id], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, u32>(1)?, r.get::<_, u32>(2)?))))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn unsub_sender_states(&self, account_id: &str) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT sender, state FROM unsub_senders WHERE account_id = ?1")?;
+        let rows = stmt.query_map([account_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn set_unsub_sender(&self, account_id: &str, sender: &str, state: &str, method: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO unsub_senders (account_id, sender, state, method) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(account_id, sender) DO UPDATE SET state = excluded.state, method = excluded.method,
+                                                          at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            params![account_id, sender.to_ascii_lowercase(), state, method],
+        )?;
+        Ok(())
     }
 
     pub fn count_messages(&self, mailbox_id: i64) -> Result<i64> {

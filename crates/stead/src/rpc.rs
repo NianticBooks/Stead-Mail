@@ -125,6 +125,17 @@ struct MessageRef {
 }
 
 #[derive(Deserialize)]
+struct UnsubParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    #[serde(default)]
+    sender: String,
+    #[serde(default)]
+    uid: u32,
+}
+
+#[derive(Deserialize)]
 struct FlagParams {
     account: String,
     #[serde(default = "default_mailbox")]
@@ -521,6 +532,27 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
             "message.delete" => {
                 let p: MessageRef = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.delete_message(&p.account, &p.mailbox, p.uid).await?)
+            }
+            "unsubscribe.scan" => {
+                let p: UnsubParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.unsubscribe_scan(&p.account, &p.mailbox, crate::unsub::SCAN_BATCH).await?)
+            }
+            "unsubscribe.suggestions" => {
+                let p: UnsubParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.unsubscribe_suggestions(&p.account, &p.mailbox)?)
+            }
+            "unsubscribe.info" => {
+                let p: UnsubParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.unsubscribe_info(&p.account, &p.mailbox, p.uid).await?)
+            }
+            "unsubscribe.run" => {
+                let p: UnsubParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.unsubscribe(&p.account, &p.mailbox, &p.sender).await?)
+            }
+            "unsubscribe.dismiss" => {
+                let p: UnsubParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                api.unsubscribe_dismiss(&p.account, &p.sender)?;
+                to_json(&serde_json::json!({}))
             }
             "google.configure" => {
                 let p: crate::google::ClientConfig = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;

@@ -1506,6 +1506,97 @@ mod tests {
         assert!(trash_mailbox(&[row("INBOX", ""), row("Cabinet", "")]).is_none());
     }
 
+    fn list_mail(from: &str, n: u32, unsub: &str, state: &Shared, flags: &str) {
+        for i in 0..n {
+            let headers = format!(
+                "From: {from}\r\nTo: fred@example.com\r\nSubject: Deal {i}\r\nDate: Wed, 28 Oct 2026 0{i}:00:00 +0000\r\nMessage-ID: <{from}-{i}@lists.test>\r\n{unsub}\r\n"
+            );
+            state.lock().unwrap().add(&headers, "Buy things.\r\n", flags);
+        }
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_suggestions_come_from_list_headers_and_can_be_dismissed() {
+        let (api, dir) = test_api();
+        let state: Shared = std::sync::Arc::new(std::sync::Mutex::new(FakeState::standard()));
+        list_mail("News <news@shop.test>", 3, "List-Unsubscribe: <mailto:out@shop.test?subject=stop>, <https://shop.test/u/9>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n", &state, "");
+        list_mail("one@once.test", 1, "List-Unsubscribe: <https://once.test/u>\r\n", &state, "");
+        list_mail("quiet@plain.test", 2, "", &state, "\\Seen");
+        let (acct, port) = fake_account(&api, state.clone()).await;
+        api.sync_with_session(plain_session(port, &acct).await, &acct, "INBOX", SyncOptions::default()).await.unwrap();
+
+        // Nothing is known until the headers have been read.
+        assert!(api.unsubscribe_suggestions("Fake", "INBOX").unwrap().is_empty());
+        let n = api.unsubscribe_scan_with_session(plain_session(port, &acct).await, &acct, "INBOX", 400).await.unwrap();
+        assert_eq!(n, 8, "every cached message is read once");
+        assert_eq!(api.unsubscribe_scan_with_session(plain_session(port, &acct).await, &acct, "INBOX", 400).await.unwrap(), 0, "and never again");
+
+        // Only the sender with 2+ messages and a header is suggested; a one-off or plain sender is not.
+        let s = api.unsubscribe_suggestions("Fake", "INBOX").unwrap();
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!((s[0].sender.as_str(), s[0].name.as_deref(), s[0].total, s[0].unread), ("news@shop.test", Some("News"), 3, 3));
+        assert!(s[0].one_click && s[0].has_mailto && s[0].has_link);
+
+        api.unsubscribe_dismiss("Fake", "News@Shop.test").unwrap();
+        assert!(api.unsubscribe_suggestions("Fake", "INBOX").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_uses_email_or_hands_back_the_page_and_never_a_local_address() {
+        let (api, dir) = test_api();
+        let state: Shared = std::sync::Arc::new(std::sync::Mutex::new(FakeState::standard()));
+        list_mail("a@mailonly.test", 2, "List-Unsubscribe: <mailto:out@mailonly.test?subject=remove%20me>\r\n", &state, "");
+        list_mail("b@webonly.test", 2, "List-Unsubscribe: <https://webonly.test/u?id=5>\r\n", &state, "");
+        list_mail("c@evil.test", 2, "List-Unsubscribe: <https://127.0.0.1/admin>, <http://evil.test/u>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n", &state, "");
+        let (acct, port) = fake_account(&api, state.clone()).await;
+        api.sync_with_session(plain_session(port, &acct).await, &acct, "INBOX", SyncOptions::default()).await.unwrap();
+        api.unsubscribe_scan_with_session(plain_session(port, &acct).await, &acct, "INBOX", 400).await.unwrap();
+        let senders: Vec<String> = api.unsubscribe_suggestions("Fake", "INBOX").unwrap().into_iter().map(|s| s.sender).collect();
+        assert_eq!(senders, vec!["a@mailonly.test", "b@webonly.test"], "a sender whose only links are unsafe is not offered");
+
+        let out = api.unsubscribe("Fake", "INBOX", "a@mailonly.test").await.unwrap();
+        assert_eq!(out.method, crate::unsub::Method::Mailto);
+        let queued = api.outbox_list(Some("Fake"), true, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].subject, "remove me");
+
+        let out = api.unsubscribe("Fake", "INBOX", "b@webonly.test").await.unwrap();
+        assert_eq!((out.method, out.url.as_deref()), (crate::unsub::Method::Web, Some("https://webonly.test/u?id=5")));
+
+        // Done senders drop out of the suggestions, and an unsafe one cannot be run by name.
+        assert!(api.unsubscribe_suggestions("Fake", "INBOX").unwrap().is_empty());
+        assert!(api.unsubscribe("Fake", "INBOX", "c@evil.test").await.is_err());
+        assert!(api.unsubscribe("Fake", "INBOX", "nobody@x.test").await.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn one_click_posts_the_fixed_body_and_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let reply = if req.contains("/redirect") { "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n" } else { "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" };
+                log.lock().unwrap().push(req);
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        crate::unsub::post_one_click(&url::Url::parse(&format!("http://127.0.0.1:{port}/u/1")).unwrap()).await.unwrap();
+        let req = seen.lock().unwrap()[0].clone();
+        assert!(req.starts_with("POST /u/1 "), "{req}");
+        assert!(req.ends_with("List-Unsubscribe=One-Click"), "{req}");
+        assert!(crate::unsub::post_one_click(&url::Url::parse(&format!("http://127.0.0.1:{port}/redirect")).unwrap()).await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2, "the redirect target was never contacted");
+    }
+
     #[tokio::test]
     async fn listing_pages_and_html_is_sanitised_for_display() {
         let (api, dir) = test_api();
