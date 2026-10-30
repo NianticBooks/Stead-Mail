@@ -40,3 +40,9 @@ export function isQuietFolder(m: Mailbox): boolean {
   const last = lower(m.name).split("/").pop() ?? "";
   return a.includes("trash") || a.includes("junk") || a.includes("all") || /\b(junk|spam|trash|deleted)\b/.test(last);
 }
+
+/** The Trash folder: marked by the server, or named like one. */
+export function isTrashFolder(m: Mailbox): boolean {
+  const last = lower(m.name).split(m.delimiter || "/").pop() ?? "";
+  return attrs(m).some((a) => a.includes("trash")) || ["trash", "bin", "deleted items", "deleted messages"].includes(last);
+}

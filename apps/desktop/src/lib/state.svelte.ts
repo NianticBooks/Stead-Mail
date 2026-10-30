@@ -4,7 +4,7 @@ import { api, shell } from "./api";
 import type { Draft } from "./types";
 import { parseRecipients, buildReply, buildReplyAll, type ComposeInit } from "./reply";
 import { isUnread } from "./format";
-import { folderEntries } from "./mailboxes";
+import { folderEntries, isQuietFolder, isTrashFolder } from "./mailboxes";
 import type {
   Account, AddAccountInput, AiConfig, AiStatus, CloudPreview, EventProposal, MessageDetail, MessageRow, Mailbox, OutboxItem,
   ProviderKind, SanitizedHtml, SearchHit, SyncReport, UnsubSuggestion, MessageUnsub,
@@ -111,6 +111,8 @@ class App {
 
   /** Messages deleted but still within the undo window, as "mailboxId:uid". Hidden from the list. */
   hidden = $state<string[]>([]);
+  #pendingBulk = new Map<string, { account: string; mailbox: string; uids: number[]; keys: string[]; timer: ReturnType<typeof setTimeout> }>();
+  #bulkId = 0;
   #pendingDeletes = new Map<string, { account: string; mailbox: string; uid: number; timer: ReturnType<typeof setTimeout> }>();
 
   /** Assistant column: mailing lists worth leaving, and what the open message's sender offers. */
@@ -128,6 +130,8 @@ class App {
 
   account = $derived(this.accounts.find((a) => a.id === this.accountId) ?? null);
   currentMailbox = $derived(this.mailboxes.find((m) => m.name === this.mailbox) ?? null);
+  /** Looking at the Trash: messages here can be moved back, not deleted again. */
+  inTrash = $derived(this.currentMailbox ? isTrashFolder(this.currentMailbox) : false);
   folders = $derived(folderEntries(this.mailboxes));
   pendingOutbox = $derived(this.outbox.filter((o) => o.state === "queued" || o.state === "sending" || o.state === "failed").length);
   failedOutbox = $derived(this.outbox.filter((o) => o.state === "failed").length);
@@ -238,7 +242,8 @@ class App {
     this.clearSearch();
     this.#clearMessage();
     await this.#loadList();
-    if (this.currentMailbox && this.currentMailbox.last_synced_at === null) await this.sync();
+    // Trash and Junk are not synced in the background, so refresh them whenever they are opened.
+    if (this.currentMailbox && (this.currentMailbox.last_synced_at === null || isQuietFolder(this.currentMailbox))) await this.sync();
   }
 
   async addAccount(input: AddAccountInput): Promise<{ warning?: string }> {
@@ -685,9 +690,9 @@ class App {
     }
   }
 
-  async unsubscribe(sender: string) {
+  async unsubscribe(sender: string): Promise<boolean> {
     const account = this.accountId;
-    if (!account || this.unsubBusy) return;
+    if (!account || this.unsubBusy) return false;
     this.unsubBusy = sender;
     try {
       const out = await api.unsubRun(account, this.mailbox, sender);
@@ -695,8 +700,10 @@ class App {
       this.toast("success", out.method === "web" ? `Opened ${sender}'s page. Confirm there to finish.` : `${sender}: ${out.detail}`);
       this.unsub = this.unsub.filter((s) => s.sender !== sender);
       if (this.messageUnsub?.sender === sender) this.messageUnsub = { ...this.messageUnsub, state: out.method === "web" ? "opened" : "unsubscribed" };
+      return true;
     } catch (e) {
       this.toast("error", `Could not unsubscribe from ${sender}: ${errText(e)}`);
+      return false;
     } finally {
       this.unsubBusy = null;
     }
@@ -724,6 +731,10 @@ class App {
     const target = row ?? this.detail;
     const account = this.accountId;
     if (!target || !account) return;
+    if (this.inTrash) {
+      this.toast("info", "This message is already in the Trash. Use “Move to Inbox” to bring it back.");
+      return;
+    }
     const mailbox = (target as Partial<SearchHit>).mailbox ?? this.mailboxes.find((m) => m.id === target.mailbox_id)?.name;
     if (!mailbox || !this.mailboxes.some((m) => m.id === target.mailbox_id)) {
       this.toast("error", "Open this message first, then delete it.");
@@ -773,8 +784,99 @@ class App {
     }
   }
 
+  /** Move every message from a sender in this folder to the Trash, after the same undo window. */
+  async deleteSender(sender: string) {
+    const account = this.accountId;
+    const mb = this.currentMailbox;
+    if (!account || !mb || this.inTrash) return;
+    let uids: number[];
+    try {
+      uids = (await api.senderMessages(account, mb.name, sender)).filter((u) => !this.hidden.includes(`${mb.id}:${u}`));
+    } catch (e) {
+      this.toast("error", errText(e));
+      return;
+    }
+    if (uids.length === 0) {
+      this.toast("info", `No messages from ${sender} in this folder.`);
+      return;
+    }
+    const keys = uids.map((u) => `${mb.id}:${u}`);
+    const before = this.rows.findIndex((r) => r.mailbox_id === mb.id && r.uid === this.selectedUid);
+    const id = `bulk:${++this.#bulkId}`;
+    this.hidden = [...this.hidden, ...keys];
+    const timer = setTimeout(() => void this.#commitBulk(id), 6000);
+    this.#pendingBulk.set(id, { account, mailbox: mb.name, uids, keys, timer });
+    if (this.selectedUid !== null && keys.includes(`${mb.id}:${this.selectedUid}`)) {
+      const rows = this.rows;
+      const next = rows[Math.min(Math.max(before, 0), rows.length - 1)];
+      if (next) await this.openMessage(next);
+      else this.#clearMessage();
+    }
+    this.toast("info", `Moved ${uids.length} message${uids.length === 1 ? "" : "s"} from ${sender} to Trash`, { label: "Undo", run: () => this.#undoBulk(id) });
+  }
+
+  #undoBulk(id: string) {
+    const p = this.#pendingBulk.get(id);
+    if (!p) return;
+    clearTimeout(p.timer);
+    this.#pendingBulk.delete(id);
+    this.hidden = this.hidden.filter((k) => !p.keys.includes(k));
+  }
+
+  async #commitBulk(id: string) {
+    const p = this.#pendingBulk.get(id);
+    if (!p) return;
+    this.#pendingBulk.delete(id);
+    try {
+      await api.deleteMany(p.account, p.mailbox, p.uids);
+      this.messages = this.messages.filter((m) => !p.keys.includes(`${m.mailbox_id}:${m.uid}`));
+      if (this.hits) this.hits = this.hits.filter((m) => !p.keys.includes(`${m.mailbox_id}:${m.uid}`));
+      this.hidden = this.hidden.filter((k) => !p.keys.includes(k));
+      void this.refreshMailboxes();
+    } catch (e) {
+      this.hidden = this.hidden.filter((k) => !p.keys.includes(k));
+      this.toast("error", `Could not move the messages to the Trash: ${errText(e)}`);
+    }
+  }
+
+  /** Move a message from the Trash back to the Inbox. */
+  async restoreMessage(row?: MessageRow | SearchHit | null) {
+    const target = row ?? this.detail;
+    const account = this.accountId;
+    const mb = this.currentMailbox;
+    if (!target || !account || !mb || !this.inTrash) return;
+    const key = `${target.mailbox_id}:${target.uid}`;
+    if (this.hidden.includes(key)) return;
+    const rows = this.rows;
+    const i = rows.findIndex((r) => r.mailbox_id === target.mailbox_id && r.uid === target.uid);
+    const neighbour = i < 0 ? null : (rows[i + 1] ?? rows[i - 1] ?? null);
+    const wasOpen = this.selectedUid === target.uid;
+    this.hidden = [...this.hidden, key];
+    if (wasOpen) {
+      if (neighbour) await this.openMessage(neighbour);
+      else this.#clearMessage();
+    }
+    try {
+      await api.restore(account, mb.name, target.uid);
+      this.messages = this.messages.filter((m) => `${m.mailbox_id}:${m.uid}` !== key);
+      this.hidden = this.hidden.filter((k) => k !== key);
+      this.toast("success", "Moved back to the Inbox");
+      void this.refreshMailboxes();
+      // Bring the Inbox up to date so the message is there when you look.
+      void api.sync(account, "INBOX").then(() => this.refreshMailboxes(), () => {});
+    } catch (e) {
+      this.hidden = this.hidden.filter((k) => k !== key);
+      this.toast("error", `Could not move the message back: ${errText(e)}`);
+    }
+  }
+
   /** Send every delete still waiting out its undo window, e.g. when the window closes. */
   flushDeletes() {
+    for (const id of [...this.#pendingBulk.keys()]) {
+      const p = this.#pendingBulk.get(id);
+      if (p) clearTimeout(p.timer);
+      void this.#commitBulk(id);
+    }
     for (const key of [...this.#pendingDeletes.keys()]) {
       const p = this.#pendingDeletes.get(key);
       if (p) clearTimeout(p.timer);

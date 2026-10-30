@@ -47,6 +47,11 @@ export const api = {
     rpc<MessageRow>("message.set_flag", { account, mailbox, uid, flag, on }),
   deleteMessage: (account: string, mailbox: string, uid: number) =>
     rpc<{ mailbox: string; uid: number; trash: string }>("message.delete", { account, mailbox, uid }),
+  deleteMany: (account: string, mailbox: string, uids: number[]) =>
+    rpc<{ mailbox: string; moved: number; trash: string }>("message.delete_many", { account, mailbox, uids }),
+  restore: (account: string, mailbox: string, uid: number) =>
+    rpc<{ from: string; uid: number; to: string }>("message.restore", { account, mailbox, uid }),
+  senderMessages: (account: string, mailbox: string, sender: string) => rpc<number[]>("sender.messages", { account, mailbox, sender }),
   unsubScan: (account: string, mailbox: string) => rpc<number>("unsubscribe.scan", { account, mailbox }),
   unsubSuggestions: (account: string, mailbox: string) => rpc<UnsubSuggestion[]>("unsubscribe.suggestions", { account, mailbox }),
   unsubInfo: (account: string, mailbox: string, uid: number) => rpc<MessageUnsub | null>("unsubscribe.info", { account, mailbox, uid }),

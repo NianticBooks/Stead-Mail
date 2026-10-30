@@ -143,16 +143,29 @@
               aria-label={isStarred(r) ? "Remove star" : "Star"}
               tabindex="-1"><Icon name="star" size={14} fill={isStarred(r)} /></button
             >
-            <button
-              class="icon-btn small trash"
-              onclick={(e) => {
-                e.stopPropagation();
-                void app.deleteMessage(r);
-              }}
-              aria-label="Move to Trash"
-              title="Move to Trash"
-              tabindex="-1"><Icon name="trash" size={14} /></button
-            >
+            {#if app.inTrash}
+              <button
+                class="icon-btn small trash"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void app.restoreMessage(r);
+                }}
+                aria-label="Move to Inbox"
+                title="Move to Inbox"
+                tabindex="-1"><Icon name="inbox" size={14} /></button
+              >
+            {:else}
+              <button
+                class="icon-btn small trash"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void app.deleteMessage(r);
+                }}
+                aria-label="Move to Trash"
+                title="Move to Trash"
+                tabindex="-1"><Icon name="trash" size={14} /></button
+              >
+            {/if}
             <time>{formatListDate(r.date ?? r.internal_date)}</time>
           </div>
           <div class="subject">{r.subject || "(no subject)"}</div>

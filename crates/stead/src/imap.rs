@@ -260,8 +260,13 @@ pub async fn unseen_count<T: ImapStream>(session: &mut Session<T>, mailbox: &str
 
 /// Add or remove one flag (`\Seen`, `\Flagged`) on a message. SILENT: no echo is wanted.
 pub async fn store_flag<T: ImapStream>(session: &mut Session<T>, uid: u32, flag: &str, add: bool) -> Result<()> {
+    store_flag_set(session, &uid.to_string(), flag, add).await
+}
+
+/// Same for a UID set such as `5,9,12`.
+pub async fn store_flag_set<T: ImapStream>(session: &mut Session<T>, uid_set: &str, flag: &str, add: bool) -> Result<()> {
     let sign = if add { '+' } else { '-' };
-    let stream = session.uid_store(uid.to_string(), format!("{sign}FLAGS.SILENT ({flag})")).await?;
+    let stream = session.uid_store(uid_set, format!("{sign}FLAGS.SILENT ({flag})")).await?;
     let _: Vec<Fetch> = stream.try_collect().await?;
     Ok(())
 }
@@ -270,15 +275,19 @@ pub async fn store_flag<T: ImapStream>(session: &mut Session<T>, uid: u32, flag:
 /// servers without it, copy + `\\Deleted` + `UID EXPUNGE`. Returns true when the fallback was used.
 /// The copy comes first, so a failure part way never loses the message.
 pub async fn move_uid<T: ImapStream>(session: &mut Session<T>, uid: u32, dest: &str) -> Result<bool> {
-    let uid_set = uid.to_string();
-    if session.uid_mv(&uid_set, dest).await.is_ok() {
+    move_uids(session, &uid.to_string(), dest).await
+}
+
+/// [`move_uid`] for a UID set such as `5,9,12`, in one command.
+pub async fn move_uids<T: ImapStream>(session: &mut Session<T>, uid_set: &str, dest: &str) -> Result<bool> {
+    if session.uid_mv(uid_set, dest).await.is_ok() {
         return Ok(false);
     }
-    session.uid_copy(&uid_set, dest).await?;
-    store_flag(session, uid, "\\Deleted", true).await?;
+    session.uid_copy(uid_set, dest).await?;
+    store_flag_set(session, uid_set, "\\Deleted", true).await?;
     // Only this uid is removed (needs UIDPLUS). A plain EXPUNGE would also drop other messages
     // somebody else had marked \Deleted, so without UIDPLUS the flag alone has to do.
-    match session.uid_expunge(&uid_set).await {
+    match session.uid_expunge(uid_set).await {
         Ok(stream) => {
             let _: std::result::Result<Vec<_>, _> = stream.try_collect::<Vec<_>>().await;
         }
@@ -486,13 +495,14 @@ pub(crate) mod fake_server {
                             "UID STORE" => {
                                 // args: "<uid> +FLAGS.SILENT (\\Seen)"
                                 let mut it = args.splitn(3, ' ');
-                                let uid: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                                let set = it.next().unwrap_or("").to_string();
                                 let op = it.next().unwrap_or("").to_ascii_uppercase();
                                 let flags: Vec<String> = it.next().unwrap_or("").trim_matches(|c| c == '(' || c == ')').split_whitespace().map(String::from).collect();
                                 let mut st = state.lock().unwrap();
-                                if let Some(m) = st.msgs.iter_mut().find(|m| m.uid == uid) {
+                                let ranges = parse_set(&set, st.msgs.iter().map(|m| m.uid).max().unwrap_or(0));
+                                for m in st.msgs.iter_mut().filter(|m| in_set(&ranges, m.uid)) {
                                     let mut cur: Vec<String> = m.flags.split_whitespace().map(String::from).collect();
-                                    for f in flags {
+                                    for f in flags.clone() {
                                         if op.starts_with('+') {
                                             if !cur.contains(&f) { cur.push(f); }
                                         } else {

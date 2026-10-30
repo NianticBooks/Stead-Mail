@@ -1080,6 +1080,13 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// UIDs of cached messages from one sender in a mailbox (address compared case-insensitively).
+    pub fn sender_uids(&self, mailbox_id: i64, sender: &str) -> Result<Vec<u32>> {
+        let mut stmt = self.conn.prepare("SELECT uid FROM messages WHERE mailbox_id = ?1 AND lower(from_addr) = lower(?2) ORDER BY uid")?;
+        let rows = stmt.query_map(params![mailbox_id, sender], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn has_unsub_row(&self, message_id: i64) -> Result<bool> {
         Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM message_unsub WHERE message_id = ?1)", [message_id], |r| r.get(0))?)
     }

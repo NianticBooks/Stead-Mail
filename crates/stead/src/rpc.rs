@@ -136,6 +136,14 @@ struct UnsubParams {
 }
 
 #[derive(Deserialize)]
+struct DeleteManyParams {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    uids: Vec<u32>,
+}
+
+#[derive(Deserialize)]
 struct FlagParams {
     account: String,
     #[serde(default = "default_mailbox")]
@@ -532,6 +540,18 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
             "message.delete" => {
                 let p: MessageRef = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.delete_message(&p.account, &p.mailbox, p.uid).await?)
+            }
+            "message.delete_many" => {
+                let p: DeleteManyParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.delete_messages(&p.account, &p.mailbox, &p.uids).await?)
+            }
+            "message.restore" => {
+                let p: MessageRef = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.restore_message(&p.account, &p.mailbox, p.uid).await?)
+            }
+            "sender.messages" => {
+                let p: UnsubParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.sender_message_uids(&p.account, &p.mailbox, &p.sender)?)
             }
             "unsubscribe.scan" => {
                 let p: UnsubParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;

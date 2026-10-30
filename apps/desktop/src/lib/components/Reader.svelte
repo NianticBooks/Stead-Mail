@@ -48,9 +48,13 @@
           <button class="icon-btn" class:on={app.prefs.assistant} onclick={() => app.setPref("assistant", !app.prefs.assistant)} title="Assistant (a)" aria-label="Show or hide the Assistant">
             <Icon name="sparkles" />
           </button>
-          <button class="icon-btn" onclick={() => void app.deleteMessage()} title="Move to Trash (#)" aria-label="Move to Trash">
-            <Icon name="trash" />
-          </button>
+          {#if app.inTrash}
+            <button class="btn sm" onclick={() => void app.restoreMessage()} title="Move this message back to the Inbox"><Icon name="inbox" size={14} /> Move to Inbox</button>
+          {:else}
+            <button class="icon-btn" onclick={() => void app.deleteMessage()} title="Move to Trash (#)" aria-label="Move to Trash">
+              <Icon name="trash" />
+            </button>
+          {/if}
         </div>
       </div>
 

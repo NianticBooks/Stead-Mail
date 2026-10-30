@@ -58,6 +58,14 @@ enum Cmd {
         #[arg(long, default_value = "INBOX")]
         mailbox: String,
     },
+    /// Move a message from the Trash back to the Inbox.
+    Restore {
+        account: String,
+        uid: u32,
+        /// The Trash folder the message is in.
+        #[arg(long, default_value = "Trash")]
+        mailbox: String,
+    },
     /// Senders worth unsubscribing from (mailing lists with several messages), and the unsubscribe itself.
     Unsubscribe {
         account: String,
@@ -571,6 +579,9 @@ async fn main() -> Result<()> {
         }),
         Cmd::Delete { account, uid, mailbox } => out(cli.json, &api.delete_message(&account, &mailbox, uid).await?, |d| {
             println!("moved {}/{} to {}", d.mailbox, d.uid, d.trash);
+        }),
+        Cmd::Restore { account, uid, mailbox } => out(cli.json, &api.restore_message(&account, &mailbox, uid).await?, |r| {
+            println!("moved {}/{} back to {}", r.from, r.uid, r.to);
         }),
         Cmd::Unsubscribe { account, sender: None, mailbox, .. } => {
             api.unsubscribe_scan(&account, &mailbox, stead::unsub::SCAN_BATCH).await?;

@@ -12,6 +12,15 @@
 
   // Which sender is waiting for a second click. Unsubscribing contacts the sender, so it asks once.
   let confirming = $state<string | null>(null);
+  // "Also move its messages to Trash" for the sender being confirmed. Off by default.
+  let alsoTrash = $state(false);
+
+  async function confirmUnsub(sender: string) {
+    const trash = alsoTrash;
+    confirming = null;
+    alsoTrash = false;
+    if ((await app.unsubscribe(sender)) && trash) await app.deleteSender(sender);
+  }
 
   // Re-read the mailing-list headers when the folder, or what the server holds, changes.
   $effect(() => {
@@ -25,6 +34,7 @@
     void d?.uid;
     void d?.mailbox;
     confirming = null;
+    alsoTrash = false;
     if (app.prefs.assistant) void app.loadMessageUnsub();
   });
 
@@ -76,21 +86,30 @@
           {#if confirming === info.sender}
             <div class="confirm" role="alertdialog" aria-label="Confirm unsubscribe">
               <p><strong>Unsubscribe from {info.name ?? info.sender}?</strong> {whatHappens(info)}</p>
+              {#if !app.inTrash && info.total > 0}
+                <label class="also"><input type="checkbox" bind:checked={alsoTrash} /> Also move its {info.total} message{info.total === 1 ? "" : "s"} in this folder to Trash</label>
+              {/if}
               <div class="row">
-                <button class="btn sm primary" disabled={app.unsubBusy !== null} onclick={() => { const s = info.sender; confirming = null; void app.unsubscribe(s); }}>
+                <button class="btn sm primary" disabled={app.unsubBusy !== null} onclick={() => void confirmUnsub(info.sender)}>
                   {app.unsubBusy === info.sender ? "Working…" : "Unsubscribe"}
                 </button>
                 <button class="btn sm ghost" onclick={() => (confirming = null)}>Cancel</button>
               </div>
             </div>
           {:else}
-            <button class="action" onclick={() => (confirming = info.sender)}>
+            <button class="action" onclick={() => { alsoTrash = false; confirming = info.sender; }}>
               <Icon name="mail" size={15} />
               <span><strong>Unsubscribe from {info.name ?? info.sender}</strong><small>{info.total} message{info.total === 1 ? "" : "s"} here · via {how(info)}</small></span>
             </button>
           {/if}
         {:else if info?.state === "unsubscribed" || info?.state === "opened"}
           <p class="done"><Icon name="check" size={14} /> {info.state === "opened" ? "You opened this sender's unsubscribe page." : "You unsubscribed from this sender."}</p>
+          {#if !app.inTrash}
+            <button class="action" onclick={() => void app.deleteSender(info.sender)}>
+              <Icon name="trash" size={15} />
+              <span><strong>Move its messages to Trash</strong><small>Every message from {info.name ?? info.sender} in this folder. You can undo.</small></span>
+            </button>
+          {/if}
         {/if}
         {#if !events.length && !needsReply && !info}
           <p class="muted small">Nothing to suggest for this message.</p>
@@ -114,15 +133,18 @@
               </div>
               {#if confirming === s.sender}
                 <p class="small">{whatHappens(s)}</p>
+                {#if !app.inTrash}
+                  <label class="also"><input type="checkbox" bind:checked={alsoTrash} /> Also move its {s.total} messages in this folder to Trash</label>
+                {/if}
                 <div class="row">
-                  <button class="btn sm primary" disabled={app.unsubBusy !== null} onclick={() => { confirming = null; void app.unsubscribe(s.sender); }}>
+                  <button class="btn sm primary" disabled={app.unsubBusy !== null} onclick={() => void confirmUnsub(s.sender)}>
                     {app.unsubBusy === s.sender ? "Working…" : "Unsubscribe"}
                   </button>
                   <button class="btn sm ghost" onclick={() => (confirming = null)}>Cancel</button>
                 </div>
               {:else}
                 <div class="row">
-                  <button class="btn sm" onclick={() => (confirming = s.sender)} title="Unsubscribe via {how(s)}">Unsubscribe</button>
+                  <button class="btn sm" onclick={() => { alsoTrash = false; confirming = s.sender; }} title="Unsubscribe via {how(s)}">Unsubscribe</button>
                   <button class="btn sm ghost" onclick={() => app.dismissUnsub(s.sender)} title="Stop suggesting this sender">Not now</button>
                 </div>
               {/if}
@@ -158,5 +180,7 @@
   .who strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
   .chip { justify-self: start; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--bg-3); color: var(--fg-1); }
+  .also { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; line-height: 1.4; cursor: pointer; }
+  .also input { margin-top: 2px; }
   .done { display: flex; gap: 6px; align-items: center; color: var(--ok); font-size: 13px; }
 </style>

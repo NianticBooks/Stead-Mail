@@ -219,6 +219,22 @@ pub struct DeleteOutcome {
     pub trash: String,
 }
 
+/// What `delete_messages` did.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteManyOutcome {
+    pub mailbox: String,
+    pub moved: usize,
+    pub trash: String,
+}
+
+/// What `restore_message` did.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    pub from: String,
+    pub uid: u32,
+    pub to: String,
+}
+
 /// The account's Trash folder: the one the server marks `\Trash`, else a well-known name
 /// (iCloud and others omit the flag).
 pub fn trash_mailbox(boxes: &[MailboxRow]) -> Option<&MailboxRow> {
@@ -991,6 +1007,94 @@ impl Api {
         Ok(DeleteOutcome { mailbox: mb.name, uid, trash })
     }
 
+    /// Cached messages from one sender in a mailbox: the UIDs `delete_messages` can take.
+    pub fn sender_message_uids(&self, key: &str, mailbox: &str, sender: &str) -> Result<Vec<u32>> {
+        let store = self.store();
+        let account = store.find_account(key)?;
+        let mb = store.find_mailbox(&account.id, mailbox)?;
+        store.sender_uids(mb.id, sender)
+    }
+
+    /// Move several cached messages to Trash in one command. Uncached UIDs are skipped.
+    pub async fn delete_messages(&self, key: &str, mailbox: &str, uids: &[u32]) -> Result<DeleteManyOutcome> {
+        let account = self.store().find_account(key)?;
+        let password = self.password_for(&account)?;
+        let client = imap::connect_tls(&account.imap.host, account.imap.port).await?;
+        let session = imap::login(client, &account.imap.username, &password).await?;
+        self.delete_messages_with_session(session, &account, mailbox, uids).await
+    }
+
+    pub async fn delete_messages_with_session<T: imap::ImapStream>(
+        &self,
+        mut session: async_imap::Session<T>,
+        account: &Account,
+        mailbox: &str,
+        uids: &[u32],
+    ) -> Result<DeleteManyOutcome> {
+        let (mb, trash, cached) = {
+            let store = self.store();
+            let mb = store.find_mailbox(&account.id, mailbox)?;
+            let trash = trash_mailbox(&store.list_mailboxes(&account.id)?)
+                .ok_or_else(|| Error::Invalid(format!("{} has no Trash folder, so nothing was deleted", account.name)))?
+                .name
+                .clone();
+            let have: std::collections::HashSet<u32> = store.list_messages_page(mb.id, usize::MAX >> 1, 0)?.iter().map(|m| m.header.uid).collect();
+            let cached: Vec<u32> = uids.iter().copied().filter(|u| have.contains(u)).collect();
+            (mb, trash, cached)
+        };
+        if mb.name.eq_ignore_ascii_case(&trash) {
+            return Err(Error::Invalid("these messages are already in the Trash".into()));
+        }
+        if cached.is_empty() {
+            return Err(Error::Invalid("none of these messages are cached; sync the mailbox first".into()));
+        }
+        imap::select_state(&mut session, &mb.name).await?;
+        // Chunks keep the command line short.
+        for chunk in cached.chunks(200) {
+            let set = chunk.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+            imap::move_uids(&mut session, &set, &trash).await?;
+            let store = self.store();
+            for uid in chunk {
+                store.remove_local_message(mb.id, *uid)?;
+            }
+        }
+        imap::logout(session).await?;
+        Ok(DeleteManyOutcome { mailbox: mb.name, moved: cached.len(), trash })
+    }
+
+    /// Move a message out of the Trash back to the Inbox. The Inbox shows it after its next sync.
+    pub async fn restore_message(&self, key: &str, mailbox: &str, uid: u32) -> Result<RestoreOutcome> {
+        let account = self.store().find_account(key)?;
+        let password = self.password_for(&account)?;
+        let client = imap::connect_tls(&account.imap.host, account.imap.port).await?;
+        let session = imap::login(client, &account.imap.username, &password).await?;
+        self.restore_message_with_session(session, &account, mailbox, uid).await
+    }
+
+    pub async fn restore_message_with_session<T: imap::ImapStream>(
+        &self,
+        mut session: async_imap::Session<T>,
+        account: &Account,
+        mailbox: &str,
+        uid: u32,
+    ) -> Result<RestoreOutcome> {
+        let (mb, inbox) = {
+            let store = self.store();
+            let mb = store.find_mailbox(&account.id, mailbox)?;
+            let boxes = store.list_mailboxes(&account.id)?;
+            if !trash_mailbox(&boxes).is_some_and(|t| t.id == mb.id) {
+                return Err(Error::Invalid("only messages in the Trash can be moved back".into()));
+            }
+            store.find_message(mb.id, uid)?;
+            (mb, store.find_mailbox(&account.id, "INBOX")?.name)
+        };
+        imap::select_state(&mut session, &mb.name).await?;
+        imap::move_uid(&mut session, uid, &inbox).await?;
+        imap::logout(session).await?;
+        self.store().remove_local_message(mb.id, uid)?;
+        Ok(RestoreOutcome { from: mb.name, uid, to: inbox })
+    }
+
     // ---- drafts (local only) ----
 
     /// Save or update a draft. An empty `id` creates one. Recipients and body are not validated:
@@ -1595,6 +1699,63 @@ mod tests {
         assert!(req.ends_with("List-Unsubscribe=One-Click"), "{req}");
         assert!(crate::unsub::post_one_click(&url::Url::parse(&format!("http://127.0.0.1:{port}/redirect")).unwrap()).await.is_err());
         assert_eq!(seen.lock().unwrap().len(), 2, "the redirect target was never contacted");
+    }
+
+    #[tokio::test]
+    async fn many_messages_move_to_trash_together_and_come_back_from_it() {
+        let (api, dir) = test_api();
+        let state: Shared = std::sync::Arc::new(std::sync::Mutex::new(FakeState::standard()));
+        state.lock().unwrap().extra_list.push("* LIST (\\HasNoChildren \\Trash) \"/\" \"Trash\"".into());
+        list_mail("News <news@shop.test>", 3, "", &state, "");
+        let (acct, port) = fake_account(&api, state.clone()).await;
+        api.sync_with_session(plain_session(port, &acct).await, &acct, "INBOX", SyncOptions::default()).await.unwrap();
+
+        let uids = api.sender_message_uids("Fake", "INBOX", "NEWS@shop.test").unwrap();
+        assert_eq!(uids.len(), 3);
+        let unseen = |api: &Api| api.list_mailboxes("Fake").unwrap().iter().find(|m| m.name == "INBOX").unwrap().unseen;
+        assert_eq!(unseen(&api), Some(4), "3 from the sender and the dentist mail are unread");
+
+        // One command for all of them; the rest of the inbox is untouched. A made-up uid is skipped.
+        state.lock().unwrap().log.clear();
+        let mut ask = uids.clone();
+        ask.push(9999);
+        let out = api.delete_messages_with_session(plain_session(port, &acct).await, &acct, "INBOX", &ask).await.unwrap();
+        assert_eq!((out.moved, out.trash.as_str()), (3, "Trash"));
+        assert_eq!(state.lock().unwrap().log.iter().filter(|l| l.contains("UID MOVE")).count(), 1);
+        assert_eq!(state.lock().unwrap().msgs.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![1001, 1002]);
+        assert_eq!(state.lock().unwrap().filed.len(), 3);
+        assert_eq!(api.list_messages("Fake", "INBOX", 50).unwrap().len(), 2);
+        assert_eq!(unseen(&api), Some(1));
+        assert!(api.delete_messages_with_session(plain_session(port, &acct).await, &acct, "INBOX", &[9999]).await.is_err());
+
+        // The fallback handles a whole set too.
+        state.lock().unwrap().no_move = true;
+        let out = api.delete_messages_with_session(plain_session(port, &acct).await, &acct, "INBOX", &[1001, 1002]).await.unwrap();
+        assert_eq!(out.moved, 2);
+        assert!(state.lock().unwrap().msgs.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn restore_moves_a_trashed_message_back_but_only_from_the_trash() {
+        let (api, dir) = test_api();
+        let state: Shared = std::sync::Arc::new(std::sync::Mutex::new(FakeState::standard()));
+        state.lock().unwrap().extra_list.push("* LIST (\\HasNoChildren \\Trash) \"/\" \"Trash\"".into());
+        let (acct, port) = fake_account(&api, state.clone()).await;
+        api.sync_with_session(plain_session(port, &acct).await, &acct, "INBOX", SyncOptions::default()).await.unwrap();
+        // Restoring from the inbox is refused: that is not what the action is for.
+        let e = api.restore_message_with_session(plain_session(port, &acct).await, &acct, "INBOX", 1001).await.unwrap_err().to_string();
+        assert!(e.contains("only messages in the Trash"), "{e}");
+
+        // The fake serves one mailbox, so cache a message into the Trash folder to stand in for a synced one.
+        let trash_id = api.store().find_mailbox(&acct.id, "Trash").unwrap().id;
+        let inbox_id = api.store().find_mailbox(&acct.id, "INBOX").unwrap().id;
+        api.store().conn.execute("UPDATE messages SET mailbox_id = ?1 WHERE mailbox_id = ?2 AND uid = 1001", rusqlite::params![trash_id, inbox_id]).unwrap();
+        let out = api.restore_message_with_session(plain_session(port, &acct).await, &acct, "Trash", 1001).await.unwrap();
+        assert_eq!((out.from.as_str(), out.to.as_str()), ("Trash", "INBOX"));
+        assert!(state.lock().unwrap().log.iter().any(|l| l.contains("UID MOVE 1001 \"INBOX\"") || l.contains("UID MOVE 1001 INBOX")));
+        assert_eq!(api.list_messages("Fake", "Trash", 50).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
