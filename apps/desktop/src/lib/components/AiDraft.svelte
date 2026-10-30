@@ -28,7 +28,7 @@
             class="input"
             bind:value={c.ai.instruction}
             placeholder="e.g. say yes, but suggest 7 instead"
-            onkeydown={(e) => e.key === "Enter" && !e.ctrlKey && (e.preventDefault(), app.draftWithAi())}
+            onkeydown={(e) => e.key === "Enter" && !e.ctrlKey && !e.metaKey && (e.preventDefault(), app.draftWithAi())}
           />
         </label>
         <div class="row">

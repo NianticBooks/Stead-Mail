@@ -2,7 +2,7 @@
 
 *Your mail stays home.*
 
-Dark-mode-first, AI-native desktop email + calendar client. Linux first, macOS next.
+Dark-mode-first, AI-native desktop email + calendar client. Runs on Linux and macOS (see [macOS](#macos)).
 
 ## Architecture
 
@@ -223,6 +223,72 @@ cd apps/desktop && npm install && npm run tauri dev
 
 Environment knobs: `STEAD_DATA_DIR`, `STEAD_SECRETS=keyring|file`, `STEAD_PASSPHRASE`,
 `RUST_LOG=stead=debug`.
+
+## macOS
+
+The same codebase builds on macOS (Apple silicon tested). Platform differences are `cfg(target_os)` gated, so
+Linux behavior is unchanged.
+
+**Build**
+
+```sh
+xcode-select --install                       # command-line tools (full Xcode also works)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust, then restart the shell
+# Node (22 tested; any install method)
+
+cd apps/desktop && npm ci && npm run build   # frontend
+cd ../..
+cargo build --release -p stead-cli -p desktop --features desktop/custom-protocol
+cargo test --workspace                       # 171 Rust tests
+(cd apps/desktop && npm test && npm run check)   # 61 vitest tests, svelte-check
+
+# Stead.app + .dmg, ad-hoc signed
+cd apps/desktop && npx tauri build --bundles app,dmg
+# -> target/release/bundle/macos/Stead.app
+# -> target/release/bundle/dmg/Stead_0.1.0_aarch64.dmg
+```
+
+The CLI/daemon is `target/release/stead`; it is not inside the app bundle.
+
+**Where things live**
+
+| What | Location |
+|---|---|
+| Data (database, fallback secrets file) | `~/Library/Application Support/mailcore/` (`mailcore.db`, `secrets.enc.json`) |
+| Secrets | macOS Keychain (login keychain), service `mailcore`, one item per secret (for example account `ai/anthropic_api_key`) |
+| Daemon socket (`stead serve --socket`) | `<data dir>/stead.sock`, mode 0600 (`XDG_RUNTIME_DIR` is unset on macOS). Unix socket paths are limited to about 104 bytes, so a very long `STEAD_DATA_DIR` fails with "path must be shorter than SUN_LEN"; set `STEAD_SOCKET` to a shorter path |
+
+The `mailcore` names are deliberate: the project was renamed to Stead, but the data directory, the `mailcore.db`
+filename and the Keychain service name keep the old name so existing profiles and stored secrets still resolve.
+Do not rename them. The Keychain backend needs no setup (the `keyring` crate's default features include it).
+`STEAD_SECRETS=file` with `STEAD_PASSPHRASE` still selects the encrypted-file fallback, and the app falls back to it
+if the Keychain cannot be used. `STEAD_DATA_DIR` moves the whole profile, which is the safe way to test.
+
+**Behavior on macOS**
+
+- **Reminders** use a native notification posted by the app under its own bundle identity
+  (`tauri-plugin-notification`); the in-window toast is unchanged. Linux keeps `notify-send`. The first notification
+  makes macOS ask for permission (System Settings > Notifications > Stead).
+- **Closing the window hides it.** The app keeps running so reminders still fire; click the Dock icon to bring the
+  window back, and use Cmd+Q to quit. Linux still exits when the window closes.
+- **Shortcuts:** hints show Cmd instead of Ctrl (Cmd+Enter sends or saves). Cmd+Enter and Ctrl+Enter both work everywhere.
+- **Theme:** the UI is dark-only, so the title bar is forced dark even when the system is in light mode.
+
+**Known gaps**
+
+- The app is ad-hoc signed, not notarized. A copy downloaded from elsewhere is quarantined: right-click > Open, or
+  `xattr -dr com.apple.quarantine Stead.app`. Notarization needs an Apple Developer Program membership, a "Developer ID
+  Application" certificate as `bundle.macOS.signingIdentity`, and `APPLE_ID` + app-specific password + `APPLE_TEAM_ID`
+  (or an App Store Connect API key) in the environment for `tauri build`.
+- The icons are still the default Tauri template. Replace `apps/desktop/src-tauri/icons/` (`npx tauri icon art.png`).
+- The bundle is arm64 only (no Intel or universal build).
+- The first time the app reads a Keychain item that another binary (for example the CLI) created, macOS may ask for access.
+- Reminders only fire while the app is running (hidden is fine, quit is not).
+- Checked on macOS: the build, all tests, a Keychain round trip, the encrypted-file fallback, the daemon socket, the
+  bundle's signature, hide-on-close, Dock reopen and Cmd+Q. Notification delivery was confirmed in the system log;
+  how the banner and toast look has not been reviewed by eye.
+- The Linux gaps still apply: Sent-copy filing, reply-all and drafts against real accounts, live Google/iCloud
+  calendar sync, cloud AI calls and single-occurrence edits to recurring events were not verified live.
 
 ## Linux graphics notes
 

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { app } from "../state.svelte";
   import { autofocus } from "../focus";
+  import { modKey } from "../platform";
   import Icon from "./Icon.svelte";
   import AiDraft from "./AiDraft.svelte";
   import { formatSize } from "../format";
@@ -112,11 +113,11 @@
       {/if}
 
       <footer>
-        <button class="btn primary" onclick={() => app.send()} disabled={c.sending} title="Send (Ctrl+Enter)">
+        <button class="btn primary" onclick={() => app.send()} disabled={c.sending} title="Send ({modKey}+Enter)">
           <Icon name={c.sending ? "loader" : "send"} size={15} /> {c.sending ? "Sending…" : "Send"}
         </button>
         <button class="btn" onclick={() => app.attachFiles()} disabled={c.sending}><Icon name="clip" size={15} /> Attach{sizeNote ? ` (${sizeNote})` : ""}</button>
-        <span class="hint muted">Ctrl+Enter to send</span>
+        <span class="hint muted">{modKey}+Enter to send</span>
         <span class="spacer"></span>
         <button class="btn ghost" onclick={close} disabled={c.sending}>Discard</button>
       </footer>

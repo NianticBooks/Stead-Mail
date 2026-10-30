@@ -197,12 +197,20 @@ pub fn run() {
         }
     });
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init());
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_plugin_notification::init());
+    builder
         .manage(Shared { api: api.clone(), watchers: Mutex::new(HashMap::new()) })
         .setup(move |app| {
             let handle = app.handle().clone();
+            // The UI is dark-only, so keep the title bar dark even when the system is light.
+            #[cfg(target_os = "macos")]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_theme(Some(tauri::Theme::Dark));
+            }
             sync_watchers(&handle, &app.state::<Shared>());
             // Queued mail is retried here too, so a message that failed while offline goes out
             // on its own once the network is back.
@@ -225,7 +233,7 @@ pub fn run() {
                 loop {
                     if let Ok(due) = remind_api.reminders_poll() {
                         for r in due {
-                            notify_reminder(&r);
+                            notify_reminder(&remind_app, &r);
                             let _ = remind_app.emit("calendar://reminder", r);
                         }
                     }
@@ -235,19 +243,54 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![diag, rpc, google_login, open_external, reveal_file, download_dir, read_ics, write_ics, restart_watchers])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // On macOS, closing the window hides it and the app keeps running, so reminders still
+            // fire. The Dock icon brings the window back; Cmd+Q quits.
+            #[cfg(target_os = "macos")]
+            match event {
+                tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } if label == "main" => {
+                    api.prevent_close();
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.hide();
+                    }
+                }
+                tauri::RunEvent::Reopen { .. } => {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+                _ => {}
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
+}
+
+/// One line for a reminder notification: when the event starts, and where.
+fn reminder_body(r: &stead::calendar::remind::DueReminder) -> String {
+    let when = if r.minutes == 0 { "now".to_string() } else if r.minutes % 1440 == 0 { format!("in {} day(s)", r.minutes / 1440) } else if r.minutes % 60 == 0 { format!("in {} h", r.minutes / 60) } else { format!("in {} min", r.minutes) };
+    match &r.location {
+        Some(l) if !l.is_empty() => format!("Starts {when} · {l}"),
+        _ => format!("Starts {when}"),
+    }
 }
 
 /// Desktop notification through `notify-send` (libnotify), which mako, dunst and GNOME all serve.
 /// Quietly does nothing when it is missing; the in-window toast still shows.
-fn notify_reminder(r: &stead::calendar::remind::DueReminder) {
-    let when = if r.minutes == 0 { "now".to_string() } else if r.minutes % 1440 == 0 { format!("in {} day(s)", r.minutes / 1440) } else if r.minutes % 60 == 0 { format!("in {} h", r.minutes / 60) } else { format!("in {} min", r.minutes) };
-    let body = match &r.location {
-        Some(l) if !l.is_empty() => format!("Starts {when} · {l}"),
-        _ => format!("Starts {when}"),
-    };
+#[cfg(not(target_os = "macos"))]
+fn notify_reminder(_app: &AppHandle, r: &stead::calendar::remind::DueReminder) {
     let _ = std::process::Command::new("notify-send")
-        .args(["--app-name=Stead", "--icon=appointment-soon", "--urgency=normal", &r.title, &body])
+        .args(["--app-name=Stead", "--icon=appointment-soon", "--urgency=normal", &r.title, &reminder_body(r)])
         .spawn();
+}
+
+/// Native notification on macOS, posted under Stead's own bundle identity. Failures are ignored;
+/// the in-window toast still shows.
+#[cfg(target_os = "macos")]
+fn notify_reminder(app: &AppHandle, r: &stead::calendar::remind::DueReminder) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app.notification().builder().title(&r.title).body(reminder_body(r)).show();
 }

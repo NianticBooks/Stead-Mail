@@ -1,5 +1,6 @@
 <script lang="ts">
   import { autofocus } from "../focus";
+  import { modKey } from "../platform";
   import { app } from "../state.svelte";
   import Icon from "./Icon.svelte";
 
@@ -15,7 +16,7 @@
     { keys: [["/"]], what: "Search" },
     { keys: [["g", "i"]], what: "Go to Inbox (press g, then i)" },
     { keys: [["g", "c"]], what: "Go to Calendar (press g, then c)" },
-    { keys: [["Ctrl", "Enter"]], what: "Send (in compose) or save (in an event)" },
+    { keys: [[modKey, "Enter"]], what: "Send (in compose) or save (in an event)" },
     { keys: [["t"]], what: "Calendar: jump to today" },
     { keys: [["n"]], what: "Calendar: new event" },
     { keys: [["["], ["←"]], what: "Calendar: previous period" },
