@@ -13,6 +13,7 @@
     { keys: [["Shift", "R"]], what: "Reply to everyone" },
     { keys: [["u"]], what: "Mark read / unread" },
     { keys: [["s"]], what: "Star / unstar" },
+    { keys: [["#"], ["Delete"]], what: "Move to Trash" },
     { keys: [["/"]], what: "Search" },
     { keys: [["g", "i"]], what: "Go to Inbox (press g, then i)" },
     { keys: [["g", "c"]], what: "Go to Calendar (press g, then c)" },

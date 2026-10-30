@@ -107,6 +107,10 @@ class App {
   helpOpen = $state(false);
   prefs = $state<Prefs>(loadPrefs());
 
+  /** Messages deleted but still within the undo window, as "mailboxId:uid". Hidden from the list. */
+  hidden = $state<string[]>([]);
+  #pendingDeletes = new Map<string, { account: string; mailbox: string; uid: number; timer: ReturnType<typeof setTimeout> }>();
+
   #openToken = 0;
   #listToken = 0;
   #toastId = 0;
@@ -119,7 +123,7 @@ class App {
   failedOutbox = $derived(this.outbox.filter((o) => o.state === "failed").length);
   aiEnabled = $derived(this.aiConfig?.enabled ?? false);
   rows = $derived.by<(MessageRow | SearchHit)[]>(() => {
-    const base = this.hits ?? this.messages;
+    const base = (this.hits ?? this.messages).filter((m) => !this.hidden.includes(`${m.mailbox_id}:${m.uid}`));
     return this.needsReplyOnly && this.hits === null ? base.filter((m) => m.triage?.needs_reply) : base;
   });
   needsReplyCount = $derived(this.messages.filter((m) => m.triage?.needs_reply).length);
@@ -631,6 +635,74 @@ class App {
 
   setSeen = (uid: number, on: boolean) => this.#setFlag(uid, "seen", on);
   setStarred = (uid: number, on: boolean) => this.#setFlag(uid, "flagged", on);
+
+  // ---------------------------------------------------------------- delete
+
+  /**
+   * Move a message to the Trash. It leaves the list at once and the move happens after an
+   * undo window, so Undo never has to fetch anything back from the server.
+   */
+  async deleteMessage(row?: MessageRow | SearchHit | null) {
+    const target = row ?? this.detail;
+    const account = this.accountId;
+    if (!target || !account) return;
+    const mailbox = (target as Partial<SearchHit>).mailbox ?? this.mailboxes.find((m) => m.id === target.mailbox_id)?.name;
+    if (!mailbox || !this.mailboxes.some((m) => m.id === target.mailbox_id)) {
+      this.toast("error", "Open this message first, then delete it.");
+      return;
+    }
+    const key = `${target.mailbox_id}:${target.uid}`;
+    if (this.#pendingDeletes.has(key)) return;
+
+    // Pick the neighbour to show next before the row disappears.
+    const rows = this.rows;
+    const i = rows.findIndex((r) => r.mailbox_id === target.mailbox_id && r.uid === target.uid);
+    const neighbour = i < 0 ? null : (rows[i + 1] ?? rows[i - 1] ?? null);
+    const wasOpen = this.selectedUid === target.uid && (this.detail?.mailbox_id ?? target.mailbox_id) === target.mailbox_id;
+
+    this.hidden = [...this.hidden, key];
+    const timer = setTimeout(() => void this.#commitDelete(key), 6000);
+    this.#pendingDeletes.set(key, { account, mailbox, uid: target.uid, timer });
+    if (wasOpen) {
+      if (neighbour) await this.openMessage(neighbour);
+      else this.#clearMessage();
+    }
+    this.toast("info", "Moved to Trash", { label: "Undo", run: () => this.#undoDelete(key) });
+  }
+
+  #undoDelete(key: string) {
+    const p = this.#pendingDeletes.get(key);
+    if (!p) return;
+    clearTimeout(p.timer);
+    this.#pendingDeletes.delete(key);
+    this.hidden = this.hidden.filter((k) => k !== key);
+  }
+
+  async #commitDelete(key: string) {
+    const p = this.#pendingDeletes.get(key);
+    if (!p) return;
+    this.#pendingDeletes.delete(key);
+    try {
+      await api.deleteMessage(p.account, p.mailbox, p.uid);
+      this.messages = this.messages.filter((m) => `${m.mailbox_id}:${m.uid}` !== key);
+      if (this.hits) this.hits = this.hits.filter((m) => `${m.mailbox_id}:${m.uid}` !== key);
+      this.hidden = this.hidden.filter((k) => k !== key);
+      void this.refreshMailboxes();
+    } catch (e) {
+      // The server refused: the message is still where it was, so put it back in the list.
+      this.hidden = this.hidden.filter((k) => k !== key);
+      this.toast("error", `Could not move the message to the Trash: ${errText(e)}`);
+    }
+  }
+
+  /** Send every delete still waiting out its undo window, e.g. when the window closes. */
+  flushDeletes() {
+    for (const key of [...this.#pendingDeletes.keys()]) {
+      const p = this.#pendingDeletes.get(key);
+      if (p) clearTimeout(p.timer);
+      void this.#commitDelete(key);
+    }
+  }
 
   // ---------------------------------------------------------------- attachments and links
 

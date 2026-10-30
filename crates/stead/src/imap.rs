@@ -249,6 +249,27 @@ pub async fn store_flag<T: ImapStream>(session: &mut Session<T>, uid: u32, flag:
     Ok(())
 }
 
+/// Move a message to another mailbox of the same account. Uses `UID MOVE` (RFC 6851) and, for
+/// servers without it, copy + `\\Deleted` + `UID EXPUNGE`. Returns true when the fallback was used.
+/// The copy comes first, so a failure part way never loses the message.
+pub async fn move_uid<T: ImapStream>(session: &mut Session<T>, uid: u32, dest: &str) -> Result<bool> {
+    let uid_set = uid.to_string();
+    if session.uid_mv(&uid_set, dest).await.is_ok() {
+        return Ok(false);
+    }
+    session.uid_copy(&uid_set, dest).await?;
+    store_flag(session, uid, "\\Deleted", true).await?;
+    // Only this uid is removed (needs UIDPLUS). A plain EXPUNGE would also drop other messages
+    // somebody else had marked \Deleted, so without UIDPLUS the flag alone has to do.
+    match session.uid_expunge(&uid_set).await {
+        Ok(stream) => {
+            let _: std::result::Result<Vec<_>, _> = stream.try_collect::<Vec<_>>().await;
+        }
+        Err(e) => tracing::warn!("UID EXPUNGE refused; message stays flagged \\Deleted: {e}"),
+    }
+    Ok(true)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleOutcome {
     /// The server pushed something (new mail, flag change, expunge). Re-sync.
@@ -304,6 +325,10 @@ pub(crate) mod fake_server {
         pub log: Vec<String>,
         /// Messages filed with APPEND: (mailbox, flags, raw).
         pub appended: Vec<(String, String, String)>,
+        /// Refuse `UID MOVE` (a server without RFC 6851), so the copy fallback is exercised.
+        pub no_move: bool,
+        /// Messages moved or copied to another mailbox: (mailbox, raw).
+        pub filed: Vec<(String, String)>,
     }
 
     impl FakeState {
@@ -319,6 +344,8 @@ pub(crate) mod fake_server {
                 extra_list: Vec::new(),
                 log: Vec::new(),
                 appended: Vec::new(),
+                no_move: false,
+                filed: Vec::new(),
             }
         }
 
@@ -458,6 +485,37 @@ pub(crate) mod fake_server {
                                     m.flags = cur.join(" ");
                                 }
                                 format!("{tag} OK STORE completed\r\n")
+                            }
+                            "UID MOVE" | "UID COPY" => {
+                                // args: `<uid> "Trash"`
+                                let (set, dest) = args.split_once(' ').unwrap_or((args.as_str(), ""));
+                                let dest = dest.trim_matches('"').to_string();
+                                let mut st = state.lock().unwrap();
+                                if cmd == "UID MOVE" && st.no_move {
+                                    format!("{tag} BAD command not supported\r\n")
+                                } else {
+                                    let max = st.msgs.iter().map(|m| m.uid).max().unwrap_or(0);
+                                    let ranges = parse_set(set, max);
+                                    let hit: Vec<FakeMsg> = st.msgs.iter().filter(|m| in_set(&ranges, m.uid)).cloned().collect();
+                                    if hit.is_empty() {
+                                        format!("{tag} NO no such message\r\n")
+                                    } else {
+                                        for m in &hit {
+                                            st.filed.push((dest.clone(), m.raw.clone()));
+                                        }
+                                        if cmd == "UID MOVE" {
+                                            st.msgs.retain(|m| !in_set(&ranges, m.uid));
+                                        }
+                                        format!("{tag} OK {cmd} completed\r\n")
+                                    }
+                                }
+                            }
+                            "UID EXPUNGE" => {
+                                let mut st = state.lock().unwrap();
+                                let max = st.msgs.iter().map(|m| m.uid).max().unwrap_or(0);
+                                let ranges = parse_set(args.trim(), max);
+                                st.msgs.retain(|m| !(in_set(&ranges, m.uid) && m.flags.contains("\\Deleted")));
+                                format!("{tag} OK UID EXPUNGE completed\r\n")
                             }
                             "APPEND" => {
                                 // args: `"Sent Messages" (\\Seen) {123}`; send the continuation, read the literal.

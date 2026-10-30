@@ -1015,6 +1015,21 @@ impl Store {
         Ok(new)
     }
 
+    /// Drop one message from the cache after it left the mailbox on the server, keeping the
+    /// unread count in step. Returns false when it was not cached.
+    pub fn remove_local_message(&self, mailbox_id: i64, uid: u32) -> Result<bool> {
+        let flags: Option<String> = self
+            .conn
+            .query_row("SELECT flags FROM messages WHERE mailbox_id = ?1 AND uid = ?2", params![mailbox_id, uid], |r| r.get(0))
+            .optional()?;
+        let Some(flags) = flags else { return Ok(false) };
+        self.conn.execute("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2", params![mailbox_id, uid])?;
+        if !flags.split_whitespace().any(|f| f == "\\Seen") {
+            self.conn.execute("UPDATE mailboxes SET unseen = MAX(0, unseen - 1) WHERE id = ?1 AND unseen IS NOT NULL", [mailbox_id])?;
+        }
+        Ok(true)
+    }
+
     pub fn count_messages(&self, mailbox_id: i64) -> Result<i64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM messages WHERE mailbox_id = ?1", [mailbox_id], |r| r.get(0))?)
     }

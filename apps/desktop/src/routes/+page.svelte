@@ -24,6 +24,10 @@
 
   onMount(() => {
     void app.init().catch((e) => app.toast("error", String(e)));
+    // Deletes wait a few seconds for Undo; closing the window must not drop them.
+    const flush = () => app.flushDeletes();
+    window.addEventListener("pagehide", flush);
+    return () => window.removeEventListener("pagehide", flush);
   });
 
   const overlayOpen = $derived(app.compose !== null || app.settingsOpen || app.outboxOpen || app.draftsOpen || app.helpOpen || cal.overlayOpen);
@@ -113,6 +117,14 @@
         break;
       case "s":
         if (app.detail) void app.setStarred(app.detail.uid, !isStarred(app.detail));
+        break;
+      case "#":
+      case "Delete":
+      case "Backspace":
+        if (app.detail) {
+          e.preventDefault();
+          void app.deleteMessage();
+        }
         break;
       case "/":
         e.preventDefault();

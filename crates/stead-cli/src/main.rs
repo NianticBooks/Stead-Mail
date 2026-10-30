@@ -51,6 +51,13 @@ enum Cmd {
         #[arg(long)]
         html: bool,
     },
+    /// Move a message to the account's Trash folder. Nothing is deleted for good.
+    Delete {
+        account: String,
+        uid: u32,
+        #[arg(long, default_value = "INBOX")]
+        mailbox: String,
+    },
     /// Full-text search over cached subjects, addresses and downloaded bodies.
     Search {
         query: String,
@@ -550,6 +557,9 @@ async fn main() -> Result<()> {
             println!();
             let body = if html { d.body_html.clone() } else { d.body_text.clone() };
             println!("{}", body.unwrap_or_else(|| "(no body)".into()));
+        }),
+        Cmd::Delete { account, uid, mailbox } => out(cli.json, &api.delete_message(&account, &mailbox, uid).await?, |d| {
+            println!("moved {}/{} to {}", d.mailbox, d.uid, d.trash);
         }),
         Cmd::Search { query, account, limit } => out(cli.json, &api.search(&query, account.as_deref(), limit)?, |hits| {
             if hits.is_empty() {

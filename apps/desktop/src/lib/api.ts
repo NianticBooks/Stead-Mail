@@ -45,6 +45,8 @@ export const api = {
     rpc<SanitizedHtml | null>("message.html", { account, mailbox, uid, allow_remote_images: allowRemoteImages }),
   setFlag: (account: string, mailbox: string, uid: number, flag: "seen" | "flagged", on: boolean) =>
     rpc<MessageRow>("message.set_flag", { account, mailbox, uid, flag, on }),
+  deleteMessage: (account: string, mailbox: string, uid: number) =>
+    rpc<{ mailbox: string; uid: number; trash: string }>("message.delete", { account, mailbox, uid }),
   thread: (account: string, threadId: string) => rpc<MessageRow[]>("thread", { account, thread_id: threadId }),
   search: (query: string, account: string | undefined, limit: number) => rpc<SearchHit[]>("search", { query, account, limit }),
 

@@ -143,6 +143,16 @@
               aria-label={isStarred(r) ? "Remove star" : "Star"}
               tabindex="-1"><Icon name="star" size={14} fill={isStarred(r)} /></button
             >
+            <button
+              class="icon-btn small trash"
+              onclick={(e) => {
+                e.stopPropagation();
+                void app.deleteMessage(r);
+              }}
+              aria-label="Move to Trash"
+              title="Move to Trash"
+              tabindex="-1"><Icon name="trash" size={14} /></button
+            >
             <time>{formatListDate(r.date ?? r.internal_date)}</time>
           </div>
           <div class="subject">{r.subject || "(no subject)"}</div>
@@ -204,8 +214,8 @@
   .from { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-1); }
   .unread .from, .unread .subject { color: var(--fg-0); font-weight: 600; }
   .clip { color: var(--fg-2); display: inline-flex; }
-  .star { opacity: 0; }
-  .row:hover .star, .star.on { opacity: 1; }
+  .star, .trash { opacity: 0; }
+  .row:hover .star, .row:hover .trash, .star.on { opacity: 1; }
   time { color: var(--fg-2); font-size: 12px; flex: none; font-variant-numeric: tabular-nums; }
   .subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-1); }
   .preview { color: var(--fg-2); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

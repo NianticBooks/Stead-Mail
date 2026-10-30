@@ -117,6 +117,14 @@ struct ReplyAllParams {
 }
 
 #[derive(Deserialize)]
+struct MessageRef {
+    account: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+    uid: u32,
+}
+
+#[derive(Deserialize)]
 struct FlagParams {
     account: String,
     #[serde(default = "default_mailbox")]
@@ -509,6 +517,10 @@ pub async fn dispatch(api: &Api, req: Request) -> Response {
             "message.set_flag" => {
                 let p: FlagParams = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
                 to_json(&api.set_flag(&p.account, &p.mailbox, p.uid, p.flag, p.on).await?)
+            }
+            "message.delete" => {
+                let p: MessageRef = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;
+                to_json(&api.delete_message(&p.account, &p.mailbox, p.uid).await?)
             }
             "google.configure" => {
                 let p: crate::google::ClientConfig = serde_json::from_value(req.params).map_err(|e| Error::Invalid(e.to_string()))?;

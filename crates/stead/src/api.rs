@@ -210,6 +210,27 @@ impl MessageFlag {
     }
 }
 
+/// What `delete_message` did.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    pub mailbox: String,
+    pub uid: u32,
+    /// The folder it was moved to.
+    pub trash: String,
+}
+
+/// The account's Trash folder: the one the server marks `\Trash`, else a well-known name
+/// (iCloud and others omit the flag).
+pub fn trash_mailbox(boxes: &[MailboxRow]) -> Option<&MailboxRow> {
+    let flagged = boxes.iter().find(|m| m.attributes.split_whitespace().any(|t| t.to_ascii_lowercase().contains("trash")));
+    flagged.or_else(|| {
+        boxes.iter().find(|m| {
+            let last = m.name.rsplit(m.delimiter.as_deref().unwrap_or("/")).next().unwrap_or(&m.name).to_ascii_lowercase();
+            matches!(last.as_str(), "trash" | "bin" | "deleted items" | "deleted messages")
+        })
+    })
+}
+
 /// Seconds to wait before retry number `attempt` (1-based) of a temporarily failing message.
 pub fn outbox_backoff_secs(attempt: i64) -> i64 {
     const STEPS: [i64; 7] = [60, 300, 900, 3600, 6 * 3600, 12 * 3600, 24 * 3600];
@@ -932,6 +953,44 @@ impl Api {
         store.find_message(mb.id, uid)
     }
 
+    /// Move a message to the account's Trash folder on the server, then drop it from the cache.
+    /// Mail is never deleted for good: with no Trash folder this refuses.
+    pub async fn delete_message(&self, key: &str, mailbox: &str, uid: u32) -> Result<DeleteOutcome> {
+        let account = self.store().find_account(key)?;
+        let password = self.password_for(&account)?;
+        let client = imap::connect_tls(&account.imap.host, account.imap.port).await?;
+        let session = imap::login(client, &account.imap.username, &password).await?;
+        self.delete_message_with_session(session, &account, mailbox, uid).await
+    }
+
+    pub async fn delete_message_with_session<T: imap::ImapStream>(
+        &self,
+        mut session: async_imap::Session<T>,
+        account: &Account,
+        mailbox: &str,
+        uid: u32,
+    ) -> Result<DeleteOutcome> {
+        let (mb, trash) = {
+            let store = self.store();
+            let mb = store.find_mailbox(&account.id, mailbox)?;
+            // Refuse before touching the server if we do not even have the message cached.
+            store.find_message(mb.id, uid)?;
+            let trash = trash_mailbox(&store.list_mailboxes(&account.id)?)
+                .ok_or_else(|| Error::Invalid(format!("{} has no Trash folder, so nothing was deleted", account.name)))?
+                .name
+                .clone();
+            (mb, trash)
+        };
+        if mb.name.eq_ignore_ascii_case(&trash) {
+            return Err(Error::Invalid("this message is already in the Trash".into()));
+        }
+        imap::select_state(&mut session, &mb.name).await?;
+        imap::move_uid(&mut session, uid, &trash).await?;
+        imap::logout(session).await?;
+        self.store().remove_local_message(mb.id, uid)?;
+        Ok(DeleteOutcome { mailbox: mb.name, uid, trash })
+    }
+
     // ---- drafts (local only) ----
 
     /// Save or update a draft. An empty `id` creates one. Recipients and body are not validated:
@@ -1363,6 +1422,88 @@ mod tests {
         assert!(api.set_flag_with_session(plain_session(port, &acct).await, &acct, "INBOX", 7777, MessageFlag::Seen, true).await.is_err());
         assert!(!state.lock().unwrap().log.iter().any(|l| l.contains("STORE")));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn delete_moves_to_trash_and_leaves_the_cache_and_unread_count_right() {
+        let (api, dir) = test_api();
+        let state: Shared = std::sync::Arc::new(std::sync::Mutex::new(FakeState::standard()));
+        state.lock().unwrap().extra_list.push("* LIST (\\HasNoChildren \\Trash) \"/\" \"Trash\"".into());
+        let (acct, port) = fake_account(&api, state.clone()).await;
+        api.sync_with_session(plain_session(port, &acct).await, &acct, "INBOX", SyncOptions::default()).await.unwrap();
+        let unseen = |api: &Api| api.list_mailboxes("Fake").unwrap().iter().find(|m| m.name == "INBOX").unwrap().unseen;
+        assert_eq!(unseen(&api), Some(1));
+
+        // 1002 is unread: it lands in Trash, leaves the cache, and the unread count drops.
+        let out = api.delete_message_with_session(plain_session(port, &acct).await, &acct, "INBOX", 1002).await.unwrap();
+        assert_eq!(out, DeleteOutcome { mailbox: "INBOX".into(), uid: 1002, trash: "Trash".into() });
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.msgs.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![1001]);
+            assert_eq!(st.filed.len(), 1);
+            assert_eq!(st.filed[0].0, "Trash");
+            assert!(st.filed[0].1.contains("dentist appointment"));
+        }
+        assert_eq!(api.list_messages("Fake", "INBOX", 50).unwrap().iter().map(|m| m.header.uid).collect::<Vec<_>>(), vec![1001]);
+        assert_eq!(unseen(&api), Some(0));
+        // The next sync agrees: nothing left to expunge or update.
+        let r = api.sync_with_session(plain_session(port, &acct).await, &acct, "INBOX", SyncOptions::default()).await.unwrap();
+        assert_eq!((r.expunged, r.flags_updated, r.cached_total), (0, 0, 1));
+
+        // A read message leaves the unread count alone, and a message we never cached is refused.
+        api.delete_message_with_session(plain_session(port, &acct).await, &acct, "INBOX", 1001).await.unwrap();
+        assert_eq!(unseen(&api), Some(0));
+        state.lock().unwrap().log.clear();
+        assert!(api.delete_message_with_session(plain_session(port, &acct).await, &acct, "INBOX", 7777).await.is_err());
+        assert!(!state.lock().unwrap().log.iter().any(|l| l.contains("MOVE") || l.contains("COPY")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn delete_falls_back_to_copy_and_expunge_without_move() {
+        let (api, dir) = test_api();
+        let state: Shared = std::sync::Arc::new(std::sync::Mutex::new(FakeState::standard()));
+        {
+            let mut st = state.lock().unwrap();
+            st.extra_list.push("* LIST (\\HasNoChildren \\Trash) \"/\" \"Trash\"".into());
+            st.no_move = true;
+        }
+        let (acct, port) = fake_account(&api, state.clone()).await;
+        api.sync_with_session(plain_session(port, &acct).await, &acct, "INBOX", SyncOptions::default()).await.unwrap();
+        api.delete_message_with_session(plain_session(port, &acct).await, &acct, "INBOX", 1001).await.unwrap();
+        let st = state.lock().unwrap();
+        assert_eq!(st.msgs.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![1002], "expunged from the inbox");
+        assert_eq!(st.filed.len(), 1, "copied to Trash first");
+        assert!(st.log.iter().any(|l| l.contains("UID COPY 1001")) && st.log.iter().any(|l| l.contains("UID EXPUNGE 1001")));
+        drop(st);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_without_a_trash_folder_and_inside_the_trash() {
+        let (api, dir) = test_api();
+        let state: Shared = std::sync::Arc::new(std::sync::Mutex::new(FakeState::standard()));
+        let (acct, port) = fake_account(&api, state.clone()).await;
+        api.sync_with_session(plain_session(port, &acct).await, &acct, "INBOX", SyncOptions::default()).await.unwrap();
+        state.lock().unwrap().log.clear();
+        let e = api.delete_message_with_session(plain_session(port, &acct).await, &acct, "INBOX", 1001).await.unwrap_err().to_string();
+        assert!(e.contains("no Trash folder"), "{e}");
+        assert_eq!(state.lock().unwrap().msgs.len(), 2, "nothing was deleted");
+        assert!(!state.lock().unwrap().log.iter().any(|l| l.contains("MOVE") || l.contains("STORE")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trash_folder_is_found_by_flag_or_by_name() {
+        let row = |name: &str, attrs: &str| MailboxRow {
+            id: 1, account_id: "a".into(), name: name.into(), delimiter: Some("/".into()), attributes: attrs.into(),
+            uidvalidity: None, uidnext: None, exists_count: None, last_synced_at: None, unseen: None,
+        };
+        let by_flag = [row("INBOX", ""), row("[Gmail]/Bin", "Extension(\"\\Trash\")"), row("Trash", "")];
+        assert_eq!(trash_mailbox(&by_flag).unwrap().name, "[Gmail]/Bin");
+        let by_name = [row("INBOX", ""), row("Deleted Messages", "")];
+        assert_eq!(trash_mailbox(&by_name).unwrap().name, "Deleted Messages");
+        assert!(trash_mailbox(&[row("INBOX", ""), row("Cabinet", "")]).is_none());
     }
 
     #[tokio::test]
