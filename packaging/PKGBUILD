@@ -14,7 +14,7 @@ optdepends=('ollama: local model for triage and event extraction (AI is off by d
 options=('!lto')
 provides=('stead')
 conflicts=('stead')
-# STEAD_SRC lets you build a local checkout: STEAD_SRC=/path/to/Stead-Mail makepkg -f
+# STEAD_SRC lets you build a local checkout: STEAD_SRC=file:///path/to/Stead-Mail makepkg -f
 source=("stead::git+${STEAD_SRC:-$url.git}")
 sha256sums=('SKIP')
 
