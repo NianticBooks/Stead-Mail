@@ -1,6 +1,6 @@
 # Maintainer: Fred Book <claude@nianticbooks.com>
 pkgname=mailcore-git
-pkgver=0.1.0.r10.f8a5cea
+pkgver=0.1.0.r11.618e239
 pkgrel=1
 pkgdesc='Dark-mode, AI-native desktop email and calendar client (IMAP, CalDAV, Google Calendar)'
 arch=('x86_64')
